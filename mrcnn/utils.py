@@ -45,6 +45,7 @@ def extract_bboxes(mask):
             x1, x2 = horizontal_indicies[[0, -1]]
             y1, y2 = vertical_indicies[[0, -1]]
             # x2 and y2 should not be part of the box. Increment by 1.
+            # x1,y1 为什么不要 -1 呢?
             x2 += 1
             y2 += 1
         else:
