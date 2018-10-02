@@ -43,15 +43,14 @@ def display_images(images, titles=None, cols=4, cmap=None, norm=None,
     interpolation: Optional. Image interpolation to use for display.
     """
     titles = titles if titles is not None else [""] * len(images)
-    rows = len(images) // cols + 1
+    rows = len(images) // cols
     plt.figure(figsize=(14, 14 * rows // cols))
     i = 1
     for image, title in zip(images, titles):
         plt.subplot(rows, cols, i)
         plt.title(title, fontsize=9)
         plt.axis('off')
-        plt.imshow(image.astype(np.uint8), cmap=cmap,
-                   norm=norm, interpolation=interpolation)
+        plt.imshow(image.astype(np.uint8), cmap=cmap, norm=norm, interpolation=interpolation)
         i += 1
     plt.show()
 
@@ -74,7 +73,7 @@ def apply_mask(image, mask, color, alpha=0.5):
     """
     for c in range(3):
         image[:, :, c] = np.where(mask == 1,
-                                  # 为什么要这么计算?
+                                  # 为什么要这么计算,以不同的颜色显示?
                                   image[:, :, c] * (1 - alpha) + alpha * color[c] * 255,
                                   image[:, :, c])
     return image
@@ -117,7 +116,7 @@ def display_instances(image, boxes, masks, class_ids, class_names,
     height, width = image.shape[:2]
     ax.set_ylim(height + 10, -10)
     ax.set_xlim(-10, width + 10)
-    ax.axis('off')
+    # ax.axis('off')
     ax.set_title(title)
 
     masked_image = image.astype(np.uint32).copy()
@@ -126,6 +125,7 @@ def display_instances(image, boxes, masks, class_ids, class_names,
 
         # Bounding box
         if not np.any(boxes[i]):
+            # box 为 (0,0,0,0) 的情况
             # Skip this instance. Has no bbox. Likely lost in image cropping.
             continue
         y1, x1, y2, x2 = boxes[i]
@@ -143,22 +143,24 @@ def display_instances(image, boxes, masks, class_ids, class_names,
             caption = "{} {:.3f}".format(label, score) if score else label
         else:
             caption = captions[i]
-        ax.text(x1, y1 + 8, caption,
-                color='w', size=11, backgroundcolor="none")
+        ax.text(x1, y1 + 8, caption, color='green', size=11, backgroundcolor="none")
 
         # Mask
         mask = masks[:, :, i]
         if show_mask:
+            # apply_mask 就是把 image 中 mask 部分填充成某种颜色
             masked_image = apply_mask(masked_image, mask, color)
 
         # Mask Polygon
         # Pad to ensure proper polygons for masks that touch image edges.
-        padded_mask = np.zeros(
-            (mask.shape[0] + 2, mask.shape[1] + 2), dtype=np.uint8)
+        padded_mask = np.zeros((mask.shape[0] + 2, mask.shape[1] + 2), dtype=np.uint8)
         padded_mask[1:-1, 1:-1] = mask
+        # 这里是根据 mask 找 polygon
         contours = find_contours(padded_mask, 0.5)
+        # verts 的 shape 是 (num_points,2) 第二维第一个元素表示 y, 第二个元素表示 x
         for verts in contours:
             # Subtract the padding and flip (y, x) to (x, y)
+            # -1 是之前加的 padding, 上下左右分别加上了 1
             verts = np.fliplr(verts) - 1
             p = Polygon(verts, facecolor="none", edgecolor=color)
             ax.add_patch(p)
@@ -292,14 +294,16 @@ def display_top_masks(image, mask, class_ids, class_names, limit=4):
     top_ids = [v[0] for v in sorted(zip(unique_class_ids, mask_area),
                                     key=lambda r: r[1], reverse=True) if v[1] > 0]
     # Generate images and titles
-    # 最多显示 limit 中 class 的 mask
+    # 显示 limit 个 class 的 mask
     for i in range(limit):
         class_id = top_ids[i] if i < len(top_ids) else -1
         # Pull masks of instances belonging to the same class.
+        # 当 class 的 个数小于 limit 的 个数, class_id == -1 就很尴尬了
+        # m 为 array([],shape=(x,y,0)), 然后执行 np.sum() 竟然能得到 np.zeros((x,y))
         m = mask[:, :, np.where(class_ids == class_id)[0]]
-        # m 假设 shape 为 (x,y,n) * (n,) 就是 -1 维度的元素分别与后面序列中的数相乘
-        # sum 第二个参数是 axis, 就是只做 -1 维度的相加,返回 m 的 shape 是 (x,y)
-        # 为什么要这么做? 是为了以不同的颜色显示?
+        # 假设 m 的 shape 为 (x,y,n) * (n,) 就是 m 的 -1 维度的元素分别与后面序列中的数相乘
+        # sum 第二个参数是 axis, 就是只做 -1 维度的相加,返回 m 的 shape 是 (x,y), 结果就是同一个 class 的不同 instance 会叠加在一起
+        # 为什么要做这样的乘法? 是为了以不同的颜色显示?
         m = np.sum(m * np.arange(1, m.shape[-1] + 1), -1)
         to_display.append(m)
         titles.append(class_names[class_id] if class_id != -1 else "-")

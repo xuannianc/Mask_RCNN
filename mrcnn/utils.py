@@ -47,11 +47,22 @@ def extract_bboxes(mask):
             y1, y2 = vertical_indicies[[0, -1]]
             # x2 and y2 should not be part of the box. Increment by 1.
             # x1,y1 为什么不要 -1 呢?
-            x2 += 1
-            y2 += 1
+            # ****************** 原代码 *****************
+            # x2 += 1
+            # y2 += 1
+            # ****************** 原代码 *****************
+            # ****************** adam ******************
+            if x2 != mask.shape[1] - 1:
+                x2 += 1
+            if y2 != mask.shape[0] - 1:
+                y2 += 1
+            if x1 > 0:
+                x1 -= 1
+            if y1 > 0:
+                y1 -= 1
+            # ****************** adam ******************
         else:
-            # No mask for this instance. Might happen due to
-            # resizing or cropping. Set bbox to zeros
+            # No mask for this instance. Might happen due to resizing or cropping. Set bbox to zeros
             x1, x2, y1, y2 = 0, 0, 0, 0
         boxes[i] = np.array([y1, x1, y2, x2])
     return boxes.astype(np.int32)
@@ -259,7 +270,7 @@ class Dataset(object):
     def __init__(self, class_map=None):
         self._image_ids = []
         self.image_info = []
-        # Background is always the first class
+        # Background is always the first class, source 表示的是数据集的名称,如 seal
         self.class_info = [{"source": "", "id": 0, "name": "BG"}]
         self.source_class_ids = {}
 
@@ -325,7 +336,7 @@ class Dataset(object):
         self.sources = list(set([i['source'] for i in self.class_info]))
         self.source_class_ids = {}
         # Loop over datasets
-        # source_class_ids 是 {'': [0], 'seal': [0, 1]}
+        # source_class_ids 是 {'': [0], 'seal': [0, 1]}, 多个 class 可能对应同一个 source
         for source in self.sources:
             self.source_class_ids[source] = []
             # Find classes that belong to this dataset
@@ -369,6 +380,7 @@ class Dataset(object):
             image = skimage.color.gray2rgb(image)
         # If has an alpha channel, remove it for consistency
         if image.shape[-1] == 4:
+            # 省略号非常有意思, 代表若干个 :
             image = image[..., :3]
         return image
 
@@ -438,6 +450,7 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square
     # Scale?
     if min_dim:
         # Scale up but not down
+        # 如果 image 的 h,w 的较小值大于 min_dim,不动.如果小于 min_dim, scale up
         scale = max(1, min_dim / min(h, w))
     if min_scale and scale < min_scale:
         scale = min_scale
@@ -449,9 +462,9 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square
             scale = max_dim / image_max
 
     # Resize image using bilinear interpolation
+    # round 四舍五入,默认不保留小数位,直接转成 int
     if scale != 1:
-        image = resize(image, (round(h * scale), round(w * scale)),
-                       preserve_range=True)
+        image = resize(image, (round(h * scale), round(w * scale)), preserve_range=True)
 
     # Need padding or cropping?
     if mode == "square":
@@ -462,6 +475,7 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square
         left_pad = (max_dim - w) // 2
         right_pad = max_dim - w - left_pad
         padding = [(top_pad, bottom_pad), (left_pad, right_pad), (0, 0)]
+        # image 的 shape 经过 pad 后会变成 (max_dim,max_dim,3)
         image = np.pad(image, padding, mode='constant', constant_values=0)
         window = (top_pad, left_pad, h + top_pad, w + left_pad)
     elif mode == "pad64":
@@ -509,6 +523,7 @@ def resize_mask(mask, scale, padding, crop=None):
     """
     # Suppress warning from scipy 0.13.0, the output shape of zoom() is
     # calculated with round() instead of int()
+    # 使用 round() 正好和 resize_image 中计算 scale 时使用 round() 保持了一致
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         mask = scipy.ndimage.zoom(mask, zoom=[scale, scale, 1], order=0)

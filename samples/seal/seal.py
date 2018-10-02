@@ -33,6 +33,7 @@ import json
 import datetime
 import numpy as np
 import skimage.draw
+import cv2
 
 # Root directory of the project
 ROOT_DIR = os.path.abspath("../../")
@@ -132,7 +133,7 @@ class SealDataset(utils.Dataset):
             # Unfortunately, VIA doesn't include it in JSON, so we must read
             # the image. This is only managable since the dataset is tiny.
             image_path = os.path.join(dataset_dir, a['filename'])
-            image = skimage.io.imread(image_path)
+            image = cv2.imread(image_path)
             height, width = image.shape[:2]
 
             self.add_image(
@@ -149,16 +150,15 @@ class SealDataset(utils.Dataset):
             one mask per instance.
         class_ids: a 1D array of class IDs of the instance masks.
         """
-        # If not a seall dataset image, delegate to parent class.
+        # If not a seal dataset image, delegate to parent class.
         image_info = self.image_info[image_id]
         if image_info["source"] != "seal":
             return super(self.__class__, self).load_mask(image_id)
 
         # Convert polygons to a bitmap mask of shape
-        # [height, width, instance_count]
         info = self.image_info[image_id]
-        mask = np.zeros([info["height"], info["width"], len(info["polygons"])],
-                        dtype=np.uint8)
+        # [height, width, instance_count]
+        mask = np.zeros([info["height"], info["width"], len(info["polygons"])], dtype=np.uint8)
         for i, p in enumerate(info["polygons"]):
             # Get indexes of pixels inside the polygon and set them to 1
             rr, cc = skimage.draw.polygon(p['all_points_y'], p['all_points_x'])

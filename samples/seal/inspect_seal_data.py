@@ -39,10 +39,11 @@ dataset.load_seal(SEAL_DIR, "train")
 # Must call before using the dataset
 dataset.prepare()
 
-print("Image Count: {}".format(len(dataset.image_ids)))
+print("Image Count: {}".format(dataset.num_images))
 print("Class Count: {}".format(dataset.num_classes))
+print('Class ids and names:')
 for i, info in enumerate(dataset.class_info):
-    print("{:3}. {:50}".format(i, info['name']))
+    print("\t{:3}. {:50}".format(i, info['name']))
 
 
 def display_mask():
@@ -51,7 +52,11 @@ def display_mask():
     for image_id in image_ids:
         image = dataset.load_image(image_id)
         mask, class_ids = dataset.load_mask(image_id)
+        # 显示面积最大的 limit(默认为4) 个 class 的 mask
         visualize.display_top_masks(image, mask, class_ids, dataset.class_names)
+
+
+# display_mask()
 
 
 def display_bbox(image_id):
@@ -100,8 +105,8 @@ def resize_image(image_id):
     visualize.display_instances(image, bboxes, mask, class_ids, dataset.class_names)
 
 
-# image_id = np.random.choice(dataset.image_ids, 1)[0]
-# resize_image(image_id)
+image_id = np.random.choice(dataset.image_ids, 1)[0]
+resize_image(image_id)
 
 def mini_mask(image_id):
     image, image_meta, class_ids, bbox, mask = modellib.load_image_gt(
