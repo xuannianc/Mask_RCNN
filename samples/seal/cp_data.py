@@ -19,16 +19,16 @@ def copy_data_from_vat_dir(subset='train'):
     region_data_file_path = osp.join(TARGET_DIR, 'via_region_data.json')
     region_data = json.load(open(region_data_file_path))
     region_data_values = list(region_data.values())
-    for region_data_value in region_data_values:
-        if region_data_value['regions']:
-            filename = region_data_value['filename']
-            src_file_path = osp.join(SOURCE_DIR, filename)
-            tgt_file_path = osp.join(TARGET_DIR, subset, filename)
-            if osp.exists(tgt_file_path):
-                logger.debug('{} already exists'.format(filename))
-            else:
-                logger.debug('copy file {}'.format(filename))
-            shutil.copy(src_file_path, tgt_file_path)
+    for idx, region_data_value in enumerate(region_data_values[80:]):
+        filename = region_data_value['filename']
+        src_file_path = osp.join(SOURCE_DIR, filename)
+        tgt_file_path = osp.join(TARGET_DIR, subset, filename)
+        if osp.exists(tgt_file_path):
+            logger.debug('{} already exists'.format(filename))
+        else:
+            logger.debug('copy {}th file {}'.format(idx, filename))
+        shutil.copy(src_file_path, tgt_file_path)
 
 
-copy_data_from_vat_dir()
+# copy_data_from_vat_dir()
+copy_data_from_vat_dir(subset='val')

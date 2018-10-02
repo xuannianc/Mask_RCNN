@@ -67,6 +67,7 @@ def compute_iou(box, boxes, box_area, boxes_area):
     efficiency. Calculate once in the caller to avoid duplicate work.
     """
     # Calculate intersection areas
+    # y1,y2,x1,x2 的 shape 都会变成 (boxes_count,)
     y1 = np.maximum(box[0], boxes[:, 0])
     y2 = np.minimum(box[2], boxes[:, 2])
     x1 = np.maximum(box[1], boxes[:, 1])
@@ -80,7 +81,7 @@ def compute_iou(box, boxes, box_area, boxes_area):
 def compute_overlaps(boxes1, boxes2):
     """Computes IoU overlaps between two sets of boxes.
     boxes1, boxes2: [N, (y1, x1, y2, x2)].
-
+    函数调用时 boxes1 通常是所有的 anchors, boxes2 通常是所有的 gt_bboxes
     For better performance, pass the largest set first and the smaller second.
     """
     # Areas of anchors and GT boxes
@@ -93,6 +94,9 @@ def compute_overlaps(boxes1, boxes2):
     for i in range(overlaps.shape[1]):
         box2 = boxes2[i]
         overlaps[:, i] = compute_iou(box2, boxes1, area2[i], area1)
+    # 返回的是所有的 anchors 和所有 gt_bboxes 的 iou
+    # 每一行表示某个 anchor 和所有 gt_bboxes 的 iou
+    # 每一列表示某个 gt_bbox 和所有 anchors 的 iou
     return overlaps
 
 
@@ -100,7 +104,7 @@ def compute_overlaps_masks(masks1, masks2):
     """Computes IoU overlaps between two sets of masks.
     masks1, masks2: [Height, Width, instances]
     """
-    
+
     # If either set of masks is empty return empty result
     if masks1.shape[0] == 0 or masks2.shape[0] == 0:
         return np.zeros((masks1.shape[0], masks2.shape[-1]))
@@ -302,6 +306,7 @@ class Dataset(object):
             return ",".join(name.split(",")[:1])
 
         # Build (or rebuild) everything else from the info dicts.
+        # class_info 是 [{'source': '', 'id': 0, 'name': 'BG'}, {'source': 'seal', 'id': 1, 'name': 'seal'}]
         self.num_classes = len(self.class_info)
         self.class_ids = np.arange(self.num_classes)
         self.class_names = [clean_name(c["name"]) for c in self.class_info]
@@ -315,9 +320,11 @@ class Dataset(object):
                                       for info, id in zip(self.image_info, self.image_ids)}
 
         # Map sources to class_ids they support
+        # sources 是 ['', 'seal']
         self.sources = list(set([i['source'] for i in self.class_info]))
         self.source_class_ids = {}
         # Loop over datasets
+        # source_class_ids 是 {'': [0], 'seal': [0, 1]}
         for source in self.sources:
             self.source_class_ids[source] = []
             # Find classes that belong to this dataset
@@ -540,6 +547,7 @@ def minimize_mask(bbox, mask, mini_shape):
             raise Exception("Invalid bounding box with area of zero")
         # Resize with bilinear interpolation
         m = skimage.transform.resize(m, mini_shape, order=1, mode="constant")
+        # np.around 是把小数变成最近的偶整数
         mini_mask[:, :, i] = np.around(m).astype(np.bool)
     return mini_mask
 
@@ -556,7 +564,7 @@ def expand_mask(bbox, mini_mask, image_shape):
         y1, x1, y2, x2 = bbox[i][:4]
         h = y2 - y1
         w = x2 - x1
-        # Resize with bilinear interpolation
+        # Resize with bilinear interpolation, 恢复到 bbox 大小
         m = skimage.transform.resize(m, (h, w), order=1, mode="constant")
         mask[y1:y2, x1:x2, i] = np.around(m).astype(np.bool)
     return mask
@@ -601,6 +609,8 @@ def generate_anchors(scales, ratios, shape, feature_stride, anchor_stride):
         value is 2 then generate anchors for every other feature map pixel.
     """
     # Get all combinations of scales and ratios
+    # 假设 meshgrid 第一个参数的 shape 是 (m,) 第二个参数的 shape 是 (n,),那么生成的两个结果的 shape 都是 (n,m)
+    # 结果的第一个元素的每一行都和第一个参数一样,结果的第二个元素的每一列都和第二个参数一样
     scales, ratios = np.meshgrid(np.array(scales), np.array(ratios))
     scales = scales.flatten()
     ratios = ratios.flatten()
@@ -634,6 +644,11 @@ def generate_pyramid_anchors(scales, ratios, feature_shapes, feature_strides,
     """Generate anchors at different levels of a feature pyramid. Each scale
     is associated with a level of the pyramid, but each ratio is used in
     all levels of the pyramid.
+    scales: config.RPN_ANCHOR_SCALES=(32, 64, 128, 256, 512)
+    ratios: config.RPN_ANCHOR_RATIOS=[0.5, 1, 2]
+    feature_shapes: backbone_shapes=(1024//4,1024//8,1024//16,1024//32,1024//64)
+    feature_strides: config.BACKBONE_STRIDES=[4, 8, 16, 32, 64]
+    anchor_stride: config.RPN_ANCHOR_STRIDE=1
 
     Returns:
     anchors: [N, (y1, x1, y2, x2)]. All generated anchors in one array. Sorted
@@ -767,14 +782,14 @@ def compute_ap_range(gt_box, gt_class_id, gt_mask,
     """Compute AP over a range or IoU thresholds. Default range is 0.5-0.95."""
     # Default is 0.5 to 0.95 with increments of 0.05
     iou_thresholds = iou_thresholds or np.arange(0.5, 1.0, 0.05)
-    
+
     # Compute AP over range of IoU thresholds
     AP = []
     for iou_threshold in iou_thresholds:
-        ap, precisions, recalls, overlaps =\
+        ap, precisions, recalls, overlaps = \
             compute_ap(gt_box, gt_class_id, gt_mask,
-                        pred_box, pred_class_id, pred_score, pred_mask,
-                        iou_threshold=iou_threshold)
+                       pred_box, pred_class_id, pred_score, pred_mask,
+                       iou_threshold=iou_threshold)
         if verbose:
             print("AP @{:.2f}:\t {:.3f}".format(iou_threshold, ap))
         AP.append(ap)

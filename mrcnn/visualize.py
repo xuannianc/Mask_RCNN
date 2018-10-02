@@ -140,7 +140,6 @@ def display_instances(image, boxes, masks, class_ids, class_names,
             class_id = class_ids[i]
             score = scores[i] if scores is not None else None
             label = class_names[class_id]
-            x = random.randint(x1, (x1 + x2) // 2)
             caption = "{} {:.3f}".format(label, score) if score else label
         else:
             caption = captions[i]
@@ -215,8 +214,7 @@ def draw_rois(image, rois, refined_rois, mask, class_ids, class_names, limit=10)
 
     # Pick random anchors in case there are too many.
     ids = np.arange(rois.shape[0], dtype=np.int32)
-    ids = np.random.choice(
-        ids, limit, replace=False) if ids.shape[0] > limit else ids
+    ids = np.random.choice(ids, limit, replace=False) if ids.shape[0] > limit else ids
 
     fig, ax = plt.subplots(1, figsize=(12, 12))
     if rois.shape[0] > limit:
@@ -263,8 +261,7 @@ def draw_rois(image, rois, refined_rois, mask, class_ids, class_names, limit=10)
     # Print stats
     print("Positive ROIs: ", class_ids[class_ids > 0].shape[0])
     print("Negative ROIs: ", class_ids[class_ids == 0].shape[0])
-    print("Positive Ratio: {:.2f}".format(
-        class_ids[class_ids > 0].shape[0] / class_ids.shape[0]))
+    print("Positive Ratio: {:.2f}".format(class_ids[class_ids > 0].shape[0] / class_ids.shape[0]))
 
 
 # TODO: Replace with matplotlib equivalent?
