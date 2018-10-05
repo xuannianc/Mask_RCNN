@@ -78,6 +78,7 @@ def compute_backbone_shapes(config, image_shape):
 
     # Currently supports ResNet only
     assert config.BACKBONE in ["resnet50", "resnet101"]
+    # math.ceil 用于向上取整, math.floor 用于向下取整
     return np.array(
         [[int(math.ceil(image_shape[0] / stride)),
             int(math.ceil(image_shape[1] / stride))]
@@ -1310,12 +1311,9 @@ def build_detection_targets(rpn_rois, gt_class_ids, gt_boxes, gt_masks, config):
            to bbox boundaries and resized to neural network output size.
     """
     assert rpn_rois.shape[0] > 0
-    assert gt_class_ids.dtype == np.int32, "Expected int but got {}".format(
-        gt_class_ids.dtype)
-    assert gt_boxes.dtype == np.int32, "Expected int but got {}".format(
-        gt_boxes.dtype)
-    assert gt_masks.dtype == np.bool_, "Expected bool but got {}".format(
-        gt_masks.dtype)
+    assert gt_class_ids.dtype == np.int32, "Expected int but got {}".format(gt_class_ids.dtype)
+    assert gt_boxes.dtype == np.int32, "Expected int but got {}".format(gt_boxes.dtype)
+    assert gt_masks.dtype == np.bool_, "Expected bool but got {}".format(gt_masks.dtype)
 
     # It's common to add GT Boxes to ROIs but we don't do that here because
     # according to XinLei Chen's paper, it doesn't help.
@@ -1328,28 +1326,28 @@ def build_detection_targets(rpn_rois, gt_class_ids, gt_boxes, gt_masks, config):
     gt_masks = gt_masks[:, :, instance_ids]
 
     # Compute areas of ROIs and ground truth boxes.
+    # shape: (num_random_rois)
     rpn_roi_area = (rpn_rois[:, 2] - rpn_rois[:, 0]) * (rpn_rois[:, 3] - rpn_rois[:, 1])
+    # shape: (num_gt_bboxes)
     gt_box_area = (gt_boxes[:, 2] - gt_boxes[:, 0]) * (gt_boxes[:, 3] - gt_boxes[:, 1])
 
     # Compute overlaps [rpn_rois, gt_boxes]
     overlaps = np.zeros((rpn_rois.shape[0], gt_boxes.shape[0]))
     for i in range(overlaps.shape[1]):
         gt = gt_boxes[i]
-        overlaps[:, i] = utils.compute_iou(
-            gt, rpn_rois, gt_box_area[i], rpn_roi_area)
+        overlaps[:, i] = utils.compute_iou(gt, rpn_rois, gt_box_area[i], rpn_roi_area)
 
     # Assign ROIs to GT boxes
     # 每一个 roi 对应的最大的 iou 的 gt_bbox 的 index
     rpn_roi_iou_argmax = np.argmax(overlaps, axis=1)
     # 每一个 roi 与所有的 gt_bboxes 的最大 iou
-    rpn_roi_iou_max = overlaps[np.arange(
-        overlaps.shape[0]), rpn_roi_iou_argmax]
+    rpn_roi_iou_max = overlaps[np.arange(overlaps.shape[0]), rpn_roi_iou_argmax]
     # GT box assigned to each ROI
-    # 每一个 roi 对应的最大 iou 的 gt_bbox.这里要注意 rpn_roi_iou_argmax 的 shape 是 (2000,)
+    # 每一个 roi 对应的最大 iou 的 gt_bbox.这里要注意 rpn_roi_iou_argmax 的 shape 是 (num_rpn_rois,)
     # 而 seal sample 中 gt_bboxes 的 shape 是 (2,4)
-    # 得到的 rpn_roi_gt_bboxes 的 shape 是 (2000,4), 这种我还是第一次见
+    # 得到的 rpn_roi_gt_bboxes 的 shape 是 (num_rpn_rois,4), 这种我还是第一次见
     rpn_roi_gt_boxes = gt_boxes[rpn_roi_iou_argmax]
-    # 每一个 roi 对应的最大 iou 的 gt_bbox 的 class_id
+    # 每一个 roi 对应的最大 iou 的 gt_bbox 的 class_id,获取的方式和 gt_bbox 一致
     rpn_roi_gt_class_ids = gt_class_ids[rpn_roi_iou_argmax]
     # Positive ROIs are those with >= 0.5 IoU with a GT box.
     fg_ids = np.where(rpn_roi_iou_max > 0.5)[0]
@@ -1374,7 +1372,7 @@ def build_detection_targets(rpn_rois, gt_class_ids, gt_boxes, gt_masks, config):
         keep_bg_ids = bg_ids
     # Combine indices of ROIs to keep
     keep = np.concatenate([keep_fg_ids, keep_bg_ids])
-    # Need more?
+    # Need more? 就是说 iou==0.5 的 roi 比较多
     remaining = config.TRAIN_ROIS_PER_IMAGE - keep.shape[0]
     if remaining > 0:
         # Looks like we don't have enough samples to maintain the desired
@@ -1391,8 +1389,8 @@ def build_detection_targets(rpn_rois, gt_class_ids, gt_boxes, gt_masks, config):
             keep = np.concatenate([keep, keep_bg_ids])
         else:
             # Fill the rest with repeated bg rois.
-            keep_extra_ids = np.random.choice(
-                keep_bg_ids, remaining, replace=True)
+            # 从 keep_bg_ids 中再选出 remaining 个,可重复
+            keep_extra_ids = np.random.choice(keep_bg_ids, remaining, replace=True)
             keep = np.concatenate([keep, keep_extra_ids])
     assert keep.shape[0] == config.TRAIN_ROIS_PER_IMAGE, \
         "keep doesn't match ROI batch size {}, {}".format(
@@ -1406,12 +1404,13 @@ def build_detection_targets(rpn_rois, gt_class_ids, gt_boxes, gt_masks, config):
     rois = rpn_rois[keep]
     roi_gt_boxes = rpn_roi_gt_boxes[keep]
     roi_gt_class_ids = rpn_roi_gt_class_ids[keep]
-    roi_gt_assignment = rpn_roi_iou_argmax[keep]
+    roi_gt_iou_argmax = rpn_roi_iou_argmax[keep]
 
     # Class-aware bbox deltas. [y, x, log(h), log(w)]
     bboxes = np.zeros((config.TRAIN_ROIS_PER_IMAGE, config.NUM_CLASSES, 4), dtype=np.float32)
     pos_ids = np.where(roi_gt_class_ids > 0)[0]
-    # 第二个参数 shape 是 (len(pos_ids,) 可以不等于 config.NUM_CLASSES 再次超出了我的认知
+    # 第二维下标要么是一个 int, 要么是 shape 为 (num_pos_ids,) 的数组
+    # box_refinement 返回的 shape 是 (num_pos_ids,)
     bboxes[pos_ids, roi_gt_class_ids[pos_ids]] = utils.box_refinement(rois[pos_ids], roi_gt_boxes[pos_ids, :4])
     # Normalize bbox refinements
     bboxes /= config.BBOX_STD_DEV
@@ -1422,8 +1421,8 @@ def build_detection_targets(rpn_rois, gt_class_ids, gt_boxes, gt_masks, config):
     for i in pos_ids:
         class_id = roi_gt_class_ids[i]
         assert class_id > 0, "class id must be greater than 0"
-        gt_id = roi_gt_assignment[i]
-        class_mask = gt_masks[:, :, gt_id]
+        gt_id = roi_gt_iou_argmax[i]
+        gt_mask = gt_masks[:, :, gt_id]
 
         if config.USE_MINI_MASK:
             # 如果使用 MINI_MASK 把 mask 放大到和原 image 一样大小
@@ -1434,14 +1433,14 @@ def build_detection_targets(rpn_rois, gt_class_ids, gt_boxes, gt_masks, config):
             gt_w = gt_x2 - gt_x1
             gt_h = gt_y2 - gt_y1
             # Resize mini mask to size of GT box
-            placeholder[gt_y1:gt_y2, gt_x1:gt_x2] = \
-                np.round(utils.resize(class_mask, (gt_h, gt_w))).astype(bool)
+            placeholder[gt_y1:gt_y2, gt_x1:gt_x2] = np.round(utils.resize(gt_mask, (gt_h, gt_w))).astype(bool)
             # Place the mini batch in the placeholder
-            class_mask = placeholder
+            gt_mask = placeholder
 
         # Pick part of the mask and resize it
         y1, x1, y2, x2 = rois[i].astype(np.int32)
-        m = class_mask[y1:y2, x1:x2]
+        # 获取 gt_mask 中的 roi 部分
+        m = gt_mask[y1:y2, x1:x2]
         mask = utils.resize(m, config.MASK_SHAPE)
         masks[i, :, :, class_id] = mask
 
@@ -1453,8 +1452,8 @@ def build_rpn_targets(image_shape, anchors, gt_class_ids, gt_boxes, config):
     anchors and deltas to refine them to match their corresponding GT boxes.
 
     anchors: [num_anchors, (y1, x1, y2, x2)]
-    gt_class_ids: [num_gt_boxes] Integer class IDs.
-    gt_boxes: [num_gt_boxes, (y1, x1, y2, x2)]
+    gt_class_ids: [num_instances] Integer class IDs.
+    gt_boxes: [num_instances, (y1, x1, y2, x2)]
 
     Returns:
     rpn_match: [N] (int32) matches between anchors and GT boxes.
@@ -1484,7 +1483,7 @@ def build_rpn_targets(image_shape, anchors, gt_class_ids, gt_boxes, config):
         # All anchors don't intersect a crowd
         no_crowd_bool = np.ones([anchors.shape[0]], dtype=bool)
 
-    # Compute overlaps [num_anchors, num_gt_boxes]
+    # Compute overlaps, shape 是 [num_anchors, num_gt_boxes]
     overlaps = utils.compute_overlaps(anchors, gt_boxes)
 
     # Match anchors to GT Boxes
@@ -1497,44 +1496,49 @@ def build_rpn_targets(image_shape, anchors, gt_class_ids, gt_boxes, config):
     #
     # 1. Set negative anchors first. They get overwritten below if a GT box is
     # matched to them. Skip boxes in crowd areas.
-    # 计算每一个 anchor 和所有 gt_bboxes 的最大 iou
+    # 计算每一个 anchor 和所有 gt_bboxes 的最大 iou, shape 是 (num_anchors,)
     anchor_iou_argmax = np.argmax(overlaps, axis=1)
+    # 注意: 如果 anchor_iou_argmax 是一个数, 那么 np.arange(overlaps.shape[0]) 是可以换成 :
+    # 但是这里 anchor_iou_argmax 是一个 shape 为 (num_anchors,) 的数组
     anchor_iou_max = overlaps[np.arange(overlaps.shape[0]), anchor_iou_argmax]
+    # 如果某个 anchor 和所有 gt_bboxes 的最大 iou 小于 0.3,那么认为该 anchor 为 negative
     rpn_match[(anchor_iou_max < 0.3) & (no_crowd_bool)] = -1
     # 2. Set an anchor for each GT box (regardless of IoU value).
     # TODO: If multiple anchors have the same IoU match all of them
-    # 计算每一个 gt_bbox 和所有 anchors 的最大 iou
+    # 计算每一个 gt_bbox 和所有 anchors 的最大 iou, 且认为该 anchor 为 positive, 不管 iou 是否大于等于 0.7
     gt_iou_argmax = np.argmax(overlaps, axis=0)
+    # 对于某个 gt_bbox 和它有最大 iou 的 anchor 设置为 positive
     rpn_match[gt_iou_argmax] = 1
     # 3. Set anchors with high overlap as positive.
+    # 如果某个 anchor 和所有 gt_bboxes 的最大 iou 大于 0.7,那么认为该 anchor 为 positive
     rpn_match[anchor_iou_max >= 0.7] = 1
 
     # Subsample to balance positive and negative anchors
     # Don't let positives be more than half the anchors
     # 计算 positive anchors 的个数
-    ids = np.where(rpn_match == 1)[0]
-    extra = len(ids) - (config.RPN_TRAIN_ANCHORS_PER_IMAGE // 2)
+    positive_ids = np.where(rpn_match == 1)[0]
+    extra = len(positive_ids) - (config.RPN_TRAIN_ANCHORS_PER_IMAGE // 2)
     if extra > 0:
         # Reset the extra ones to neutral
-        # 随机挑选多余个数的 anchors 设置为 neutral
-        ids = np.random.choice(ids, extra, replace=False)
+        # 随机挑选 extra 个数的 anchors 设置为 neutral
+        ids = np.random.choice(positive_ids, extra, replace=False)
         rpn_match[ids] = 0
     # 计算 negative anchors 的个数
     # Same for negative proposals
-    ids = np.where(rpn_match == -1)[0]
-    extra = len(ids) - (config.RPN_TRAIN_ANCHORS_PER_IMAGE -
-                        np.sum(rpn_match == 1))
+    negative_ids = np.where(rpn_match == -1)[0]
+    extra = len(negative_ids) - (config.RPN_TRAIN_ANCHORS_PER_IMAGE - np.sum(rpn_match == 1))
     if extra > 0:
-        # Rest the extra ones to neutral
-        ids = np.random.choice(ids, extra, replace=False)
+        # Reset the extra ones to neutral
+        ids = np.random.choice(negative_ids, extra, replace=False)
         rpn_match[ids] = 0
 
     # For positive anchors, compute shift and scale needed to transform them
     # to match the corresponding GT boxes.
-    ids = np.where(rpn_match == 1)[0]
+    # 因为 positive 已经经过平衡,所以要重新计算
+    positive_ids = np.where(rpn_match == 1)[0]
     ix = 0  # index into rpn_bbox
     # TODO: use box_refinement() rather than duplicating the code here
-    for i, a in zip(ids, anchors[ids]):
+    for i, a in zip(positive_ids, anchors[positive_ids]):
         # Closest gt box (it might have IoU < 0.7)
         gt = gt_boxes[anchor_iou_argmax[i]]
 
@@ -1585,33 +1589,32 @@ def generate_random_rois(image_shape, count, gt_class_ids, gt_boxes):
         h = gt_y2 - gt_y1
         w = gt_x2 - gt_x1
         # random boundaries
-        # 为什么设置这么个范围?
-        r_y1 = max(gt_y1 - h, 0)
-        r_y2 = min(gt_y2 + h, image_shape[0])
-        r_x1 = max(gt_x1 - w, 0)
-        r_x2 = min(gt_x2 + w, image_shape[1])
+        # 设置 roi 四个坐标点的位置范围
+        min_y = max(gt_y1 - h, 0)
+        max_y = min(gt_y2 + h, image_shape[0])
+        min_x = max(gt_x1 - w, 0)
+        max_x = min(gt_x2 + w, image_shape[1])
 
         # To avoid generating boxes with zero area, we generate double what
         # we need and filter out the extra. If we get fewer valid boxes
         # than we need, we loop and try again.
         while True:
-            y1y2 = np.random.randint(r_y1, r_y2, (rois_per_box * 2, 2))
-            x1x2 = np.random.randint(r_x1, r_x2, (rois_per_box * 2, 2))
+            y1y2 = np.random.randint(min_y, max_y, (rois_per_box * 2, 2))
+            x1x2 = np.random.randint(min_x, max_x, (rois_per_box * 2, 2))
             # Filter out zero area boxes
             threshold = 1
             # 获取 rois_per_box 个 y1,y2
-            y1y2 = y1y2[np.abs(y1y2[:, 0] - y1y2[:, 1]) >=
-                        threshold][:rois_per_box]
+            y1y2 = y1y2[np.abs(y1y2[:, 0] - y1y2[:, 1]) >= threshold][:rois_per_box]
             # 获取 rois_per_box 个 x1,x2
-            x1x2 = x1x2[np.abs(x1x2[:, 0] - x1x2[:, 1]) >=
-                        threshold][:rois_per_box]
+            x1x2 = x1x2[np.abs(x1x2[:, 0] - x1x2[:, 1]) >= threshold][:rois_per_box]
             if y1y2.shape[0] == rois_per_box and x1x2.shape[0] == rois_per_box:
                 break
 
-        # Sort on axis 1 to ensure x1 <= x2 and y1 <= y2 and then reshape
-        # into x1, y1, x2, y2 order
+        # Sort on axis 1 to ensure x1 <= x2 and y1 <= y2 and then split into x1, x2, y1, y2
+        # 先排序是 x1 <= x2,y1 <= y2, 然后拆分
         x1, x2 = np.split(np.sort(x1x2, axis=1), 2, axis=1)
         y1, y2 = np.split(np.sort(y1y2, axis=1), 2, axis=1)
+        # stack into y1,x1,y2,x2, 构建成 [y1,x1,y2,x2] 的形式
         box_rois = np.hstack([y1, x1, y2, x2])
         rois[rois_per_box * i:rois_per_box * (i + 1)] = box_rois
 
@@ -1642,7 +1645,7 @@ def generate_random_rois(image_shape, count, gt_class_ids, gt_boxes):
 
 
 def data_generator(dataset, config, shuffle=True, augment=False, augmentation=None,
-                   random_rois=0, batch_size=1, detection_targets=False,
+                   num_random_rois=0, batch_size=1, detection_targets=False,
                    no_augmentation_sources=None):
     """A generator that returns images and corresponding target class ids,
     bounding box deltas, and masks.
@@ -1690,9 +1693,9 @@ def data_generator(dataset, config, shuffle=True, augment=False, augmentation=No
     error_count = 0
     no_augmentation_sources = no_augmentation_sources or []
 
+    backbone_shapes = compute_backbone_shapes(config, config.IMAGE_SHAPE)
     # Anchors
     # [anchor_count, (y1, x1, y2, x2)]
-    backbone_shapes = compute_backbone_shapes(config, config.IMAGE_SHAPE)
     anchors = utils.generate_pyramid_anchors(config.RPN_ANCHOR_SCALES,
                                              config.RPN_ANCHOR_RATIOS,
                                              backbone_shapes,
@@ -1715,69 +1718,63 @@ def data_generator(dataset, config, shuffle=True, augment=False, augmentation=No
             if dataset.image_info[image_id]['source'] in no_augmentation_sources:
                 image, image_meta, gt_class_ids, gt_boxes, gt_masks = \
                 load_image_gt(dataset, config, image_id, augment=augment,
-                              augmentation=None,
-                              use_mini_mask=config.USE_MINI_MASK)
+                              augmentation=None, use_mini_mask=config.USE_MINI_MASK)
             else:
                 image, image_meta, gt_class_ids, gt_boxes, gt_masks = \
                     load_image_gt(dataset, config, image_id, augment=augment,
-                                augmentation=augmentation,
-                                use_mini_mask=config.USE_MINI_MASK)
+                                augmentation=augmentation, use_mini_mask=config.USE_MINI_MASK)
 
             # Skip images that have no instances. This can happen in cases
             # where we train on a subset of classes and the image doesn't
             # have any of the classes we care about.
+            # 如果 gt_class_ids 都为 0,相当于 np.zeros(num_instances)
             if not np.any(gt_class_ids > 0):
                 continue
 
             # RPN Targets
             # rpn_match 的 shape 是 (num_anchors,), 每一个元素为 -1,0,1.其中 -1 表示 negative,0 表示 neutral,1 表示 positive
-            # 默认 num_anchors = 2000
-            # rpn_bbox 的 shape 是 (num_train_anchors,4) 一半是 positive 的, 一半是 negative 的
+            # rpn_bbox 的 shape 是 (num_train_anchors,4)
             # 默认 num_train_anchors=config.RPN_TRAIN_ANCHORS_PER_IMAGE=256
+            # 前 num_positive_anchors 为 [delta_h,delta_w,log(gt_h/a_h),log(gt_w/a_w)]
+            # 后 num_train_anchors-num_positive_anchors 为 [0,0,0,0]
             rpn_match, rpn_bbox = build_rpn_targets(image.shape, anchors, gt_class_ids, gt_boxes, config)
 
             # Mask R-CNN Targets
-            if random_rois:
-                # rpn_rois 的 shape 是 (random_rois, 4)
-                rpn_rois = generate_random_rois(image.shape, random_rois, gt_class_ids, gt_boxes)
+            if num_random_rois:
+                # rpn_rois 的 shape 是 (num_random_rois, 4)
+                # num_random_rois * 90% 的 rois 是在 gt_bbox 的周围, 其余 10% 则是任意的.为什么要这么生成 rois?
+                rpn_rois = generate_random_rois(image.shape, num_random_rois, gt_class_ids, gt_boxes)
                 if detection_targets:
+                    # rois 的 shape 是 (num_train_rois, 4)
+                    # num_train_rois=config.TRAIN_ROIS_PER_IMAGE=200
+                    # mrcnn_class_ids 的 shape 是 (num_train_rois,)
+                    # mrcnn_bbox 的 shape 是 (num_train_rois, dataset.num_classes, 4)
+                    # mrcnn_mask 的 shape 是 (num_train_rois, config.MASK_SHAPE[0]=28, config.MASK_SHAPE[1]=28, dataset.num_classes)
                     rois, mrcnn_class_ids, mrcnn_bbox, mrcnn_mask =\
                         build_detection_targets(rpn_rois, gt_class_ids, gt_boxes, gt_masks, config)
 
             # Init batch arrays
             if b == 0:
-                batch_image_meta = np.zeros(
-                    (batch_size,) + image_meta.shape, dtype=image_meta.dtype)
-                batch_rpn_match = np.zeros(
-                    [batch_size, anchors.shape[0], 1], dtype=rpn_match.dtype)
-                batch_rpn_bbox = np.zeros(
-                    [batch_size, config.RPN_TRAIN_ANCHORS_PER_IMAGE, 4], dtype=rpn_bbox.dtype)
-                batch_images = np.zeros(
-                    (batch_size,) + image.shape, dtype=np.float32)
-                batch_gt_class_ids = np.zeros(
-                    (batch_size, config.MAX_GT_INSTANCES), dtype=np.int32)
-                batch_gt_boxes = np.zeros(
-                    (batch_size, config.MAX_GT_INSTANCES, 4), dtype=np.int32)
-                batch_gt_masks = np.zeros(
-                    (batch_size, gt_masks.shape[0], gt_masks.shape[1],
+                batch_image_meta = np.zeros((batch_size,) + image_meta.shape, dtype=image_meta.dtype)
+                batch_rpn_match = np.zeros([batch_size, anchors.shape[0], 1], dtype=rpn_match.dtype)
+                batch_rpn_bbox = np.zeros([batch_size, config.RPN_TRAIN_ANCHORS_PER_IMAGE, 4], dtype=rpn_bbox.dtype)
+                batch_images = np.zeros((batch_size,) + image.shape, dtype=np.float32)
+                batch_gt_class_ids = np.zeros((batch_size, config.MAX_GT_INSTANCES), dtype=np.int32)
+                batch_gt_boxes = np.zeros((batch_size, config.MAX_GT_INSTANCES, 4), dtype=np.int32)
+                batch_gt_masks = np.zeros((batch_size, gt_masks.shape[0], gt_masks.shape[1],
                      config.MAX_GT_INSTANCES), dtype=gt_masks.dtype)
-                if random_rois:
-                    batch_rpn_rois = np.zeros(
-                        (batch_size, rpn_rois.shape[0], 4), dtype=rpn_rois.dtype)
+                if num_random_rois:
+                    batch_rpn_rois = np.zeros((batch_size, rpn_rois.shape[0], 4), dtype=rpn_rois.dtype)
                     if detection_targets:
-                        batch_rois = np.zeros(
-                            (batch_size,) + rois.shape, dtype=rois.dtype)
+                        batch_rois = np.zeros((batch_size,) + rois.shape, dtype=rois.dtype)
                         batch_mrcnn_class_ids = np.zeros(
                             (batch_size,) + mrcnn_class_ids.shape, dtype=mrcnn_class_ids.dtype)
-                        batch_mrcnn_bbox = np.zeros(
-                            (batch_size,) + mrcnn_bbox.shape, dtype=mrcnn_bbox.dtype)
-                        batch_mrcnn_mask = np.zeros(
-                            (batch_size,) + mrcnn_mask.shape, dtype=mrcnn_mask.dtype)
+                        batch_mrcnn_bbox = np.zeros((batch_size,) + mrcnn_bbox.shape, dtype=mrcnn_bbox.dtype)
+                        batch_mrcnn_mask = np.zeros((batch_size,) + mrcnn_mask.shape, dtype=mrcnn_mask.dtype)
 
             # If more instances than fits in the array, sub-sample from them.
             if gt_boxes.shape[0] > config.MAX_GT_INSTANCES:
-                ids = np.random.choice(
-                    np.arange(gt_boxes.shape[0]), config.MAX_GT_INSTANCES, replace=False)
+                ids = np.random.choice(np.arange(gt_boxes.shape[0]), config.MAX_GT_INSTANCES, replace=False)
                 gt_class_ids = gt_class_ids[ids]
                 gt_boxes = gt_boxes[ids]
                 gt_masks = gt_masks[:, :, ids]
@@ -1786,11 +1783,12 @@ def data_generator(dataset, config, shuffle=True, augment=False, augmentation=No
             batch_image_meta[b] = image_meta
             batch_rpn_match[b] = rpn_match[:, np.newaxis]
             batch_rpn_bbox[b] = rpn_bbox
+            # mold_image 是减掉像素平均数
             batch_images[b] = mold_image(image.astype(np.float32), config)
             batch_gt_class_ids[b, :gt_class_ids.shape[0]] = gt_class_ids
             batch_gt_boxes[b, :gt_boxes.shape[0]] = gt_boxes
             batch_gt_masks[b, :, :, :gt_masks.shape[-1]] = gt_masks
-            if random_rois:
+            if num_random_rois:
                 batch_rpn_rois[b] = rpn_rois
                 if detection_targets:
                     batch_rois[b] = rois
@@ -1805,16 +1803,17 @@ def data_generator(dataset, config, shuffle=True, augment=False, augmentation=No
                           batch_gt_class_ids, batch_gt_boxes, batch_gt_masks]
                 outputs = []
 
-                if random_rois:
+                if num_random_rois:
                     inputs.extend([batch_rpn_rois])
                     if detection_targets:
                         inputs.extend([batch_rois])
                         # Keras requires that output and targets have the same number of dimensions
                         # 所以为什么要 expand_dims 要看一下模型最后的输出
-                        batch_mrcnn_class_ids = np.expand_dims(
-                            batch_mrcnn_class_ids, -1)
-                        outputs.extend(
-                            [batch_mrcnn_class_ids, batch_mrcnn_bbox, batch_mrcnn_mask])
+                        # batch_mrcnn_class_ids 原来 shape 是 (batch_size, num_train_rois)
+                        # expand_dims 之后的 shape 是 (batch_size, num_train_rois, 1)
+                        batch_mrcnn_class_ids = np.expand_dims(batch_mrcnn_class_ids, -1)
+                        # extend 不同于 append 之处就在于同时添加多个元素
+                        outputs.extend([batch_mrcnn_class_ids, batch_mrcnn_bbox, batch_mrcnn_mask])
 
                 yield inputs, outputs
 

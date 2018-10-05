@@ -73,6 +73,7 @@ def display_bbox(image_id):
     log("class_ids", class_ids)
     log("bbox", bboxes)
     # Display image and instances
+    # 显示 instance 的 bbox 和 mask
     visualize.display_instances(image, bboxes, mask, class_ids, dataset.class_names)
 
 
@@ -105,8 +106,8 @@ def resize_image(image_id):
     visualize.display_instances(image, bboxes, mask, class_ids, dataset.class_names)
 
 
-image_id = np.random.choice(dataset.image_ids, 1)[0]
-resize_image(image_id)
+# image_id = np.random.choice(dataset.image_ids, 1)[0]
+# resize_image(image_id)
 
 def mini_mask(image_id):
     image, image_meta, class_ids, bbox, mask = modellib.load_image_gt(
@@ -134,10 +135,13 @@ def mini_mask(image_id):
 
 # image_id = np.random.choice(dataset.image_ids, 1)[0]
 # mini_mask(image_id)
+
+
 def generate_anchors():
-    # 显示所有 layer 中间的 anchors
     # Generate Anchors
+    # np.array([[256,256],[128,128],[64,64],[32,32],[16,16]])
     backbone_shapes = modellib.compute_backbone_shapes(config, config.IMAGE_SHAPE)
+    # shape 是 (256*256*3+128*128*3+64*64*3+32*32*3+16*16*3,4)=(261888,4)
     anchors = utils.generate_pyramid_anchors(config.RPN_ANCHOR_SCALES,
                                              config.RPN_ANCHOR_RATIOS,
                                              backbone_shapes,
@@ -162,15 +166,16 @@ def generate_anchors():
 
 def visualize_center_anchors(image_id, anchors_per_cell):
     # Visualize anchors of one cell at the center of the feature map of a specific level
+    # 显示所有 layer 中间的 anchors
     backbone_shapes, anchors, anchors_per_level = generate_anchors()
     # Load and draw random image
-    image, image_meta, _, _, _ = modellib.load_image_gt(dataset, config, image_id)
+    image, _, _, _, _ = modellib.load_image_gt(dataset, config, image_id)
     fig, ax = plt.subplots(1, figsize=(10, 10))
     ax.imshow(image)
     num_levels = len(backbone_shapes)
+    colors = visualize.random_colors(num_levels)
 
     for level in range(num_levels):
-        colors = visualize.random_colors(num_levels)
         # Compute the index of the anchors at the center of the image
         level_start = sum(anchors_per_level[:level])  # sum of anchors of previous levels
         level_anchors = anchors[level_start:level_start + anchors_per_level[level]]
@@ -178,14 +183,14 @@ def visualize_center_anchors(image_id, anchors_per_cell):
                                                                       backbone_shapes[level]))
         # backbone_shapes 为 [(256,256),(128,128),(64,64),(32,32),(16,16)]
         center_cell = backbone_shapes[level] // 2
-        center_anchor = anchors_per_cell * (
+        level_center_anchor_idx = anchors_per_cell * (
                 (center_cell[0] * backbone_shapes[level][1] / config.RPN_ANCHOR_STRIDE ** 2) \
                 + center_cell[1] / config.RPN_ANCHOR_STRIDE)
-        level_center = int(center_anchor)
+        level_center_anchor_idx = int(level_center_anchor_idx)
 
         # Draw anchors. Brightness show the order in the array, dark to bright.
-        for i, rect in enumerate(level_anchors[level_center:level_center + anchors_per_cell]):
-            y1, x1, y2, x2 = rect
+        for i, anchor in enumerate(level_anchors[level_center_anchor_idx:level_center_anchor_idx + anchors_per_cell]):
+            y1, x1, y2, x2 = anchor
             p = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=2, facecolor='none',
                                   edgecolor=(i + 1) * np.array(colors[level]) / anchors_per_cell)
             ax.add_patch(p)
@@ -195,9 +200,10 @@ def visualize_center_anchors(image_id, anchors_per_cell):
 # image_id = np.random.choice(dataset.image_ids, 1)[0]
 # visualize_center_anchors(image_id, anchors_per_cell=len(config.RPN_ANCHOR_RATIOS))
 
+
 def create_data_generator(num_random_rois=2000, detection_targets=True):
     # Create data generator
-    g = modellib.data_generator(dataset, config, shuffle=True, random_rois=num_random_rois, batch_size=4,
+    g = modellib.data_generator(dataset, config, shuffle=True, num_random_rois=num_random_rois, batch_size=4,
                                 detection_targets=detection_targets)
     return g, num_random_rois, detection_targets
 
@@ -232,6 +238,7 @@ def evaluate_data_generator():
 
 # evaluate_data_generator()
 
+
 def show_anchors():
     g, _, _ = create_data_generator(num_random_rois=0)
     # Get Next Image
@@ -239,17 +246,17 @@ def show_anchors():
     b = 0
     # Restore original image (reverse normalization)
     sample_image = modellib.unmold_image(normalized_images[b], config)
-    # Compute anchor shifts.
-    indices = np.where(rpn_match[b] == 1)[0]
-    # Generate anchors
-    backbone_shapes, anchors, anchors_per_level = generate_anchors()
-    refined_anchors = utils.apply_box_deltas(anchors[indices], rpn_bbox[b, :len(indices)] * config.RPN_BBOX_STD_DEV)
-    log("anchors", anchors)
-    log("refined_anchors", refined_anchors)
 
     # Get list of positive anchors
     positive_anchor_ids = np.where(rpn_match[b] == 1)[0]
+    # Generate anchors
+    backbone_shapes, anchors, anchors_per_level = generate_anchors()
+    # Compute anchor shifts.
+    refined_anchors = utils.apply_box_deltas(anchors[positive_anchor_ids],
+                                             rpn_bbox[b, :len(positive_anchor_ids)] * config.RPN_BBOX_STD_DEV)
+    log("anchors", anchors)
     print("Positive anchors: {}".format(len(positive_anchor_ids)))
+    log("refined_anchors", refined_anchors)
     negative_anchor_ids = np.where(rpn_match[b] == -1)[0]
     print("Negative anchors: {}".format(len(negative_anchor_ids)))
     neutral_anchor_ids = np.where(rpn_match[b] == 0)[0]
@@ -257,12 +264,11 @@ def show_anchors():
 
     # Show positive anchors
     fig, ax = plt.subplots(1, figsize=(16, 16))
-    visualize.draw_boxes(sample_image.copy(), boxes=anchors[positive_anchor_ids],
-                         refined_boxes=refined_anchors, ax=ax)
+    visualize.draw_boxes(sample_image, boxes=anchors[positive_anchor_ids], refined_boxes=refined_anchors, ax=ax)
     # Show negative anchors
-    visualize.draw_boxes(sample_image.copy(), boxes=anchors[negative_anchor_ids])
+    visualize.draw_boxes(sample_image, boxes=anchors[negative_anchor_ids], ax=ax)
     # Show neutral anchors. They don't contribute to training.
-    visualize.draw_boxes(sample_image.copy(), boxes=anchors[np.random.choice(neutral_anchor_ids, 100)])
+    visualize.draw_boxes(sample_image, boxes=anchors[np.random.choice(neutral_anchor_ids, 100)], ax=ax)
     plt.show()
 
 
@@ -272,21 +278,22 @@ def show_rois():
     g, num_random_rois, detection_targets = create_data_generator()
     [normalized_images, image_meta, rpn_match, rpn_bbox, gt_class_ids, gt_boxes, gt_masks, rpn_rois, rois], \
     [mrcnn_class_ids, mrcnn_bbox, mrcnn_mask] = next(g)
-    # Remove the last dim in mrcnn_class_ids. It's only added
-    # to satisfy Keras restriction on target shape.
-    # 原来的 mrcnn_class_idx 的 shape 是 (batch_size, num_rois, 1)
+    # Remove the last dim in mrcnn_class_ids. It's only added to satisfy Keras restriction on target shape.
+    # 原来的 mrcnn_class_idx 的 shape 是 (batch_size, num_train_rois, 1)
     mrcnn_class_ids = mrcnn_class_ids[:, :, 0]
     b = 0
     # Restore original image (reverse normalization)
     sample_image = modellib.unmold_image(normalized_images[b], config)
     # Class aware bboxes
-    # mrcnn_bbox 的 shape 是 (batch_size,num_rois,num_classes,4)
-    # mrcnn_class_idx 的 shape 是 (batch_size, num_rois)
+    # mrcnn_bbox 的 shape 是 (batch_size, num_train_rois, dataset.num_classes,4)
+    # mrcnn_class_idx 的 shape 是 (batch_size, num_train_rois)
+    # bbox_specific 的 shape 是 (num_train_rois, dataset.num_classes, 4)
     bbox_specific = mrcnn_bbox[b, np.arange(mrcnn_bbox.shape[1]), mrcnn_class_ids[b], :]
     # Refined ROIs
     refined_rois = utils.apply_box_deltas(rois[b].astype(np.float32), bbox_specific[:, :4] * config.BBOX_STD_DEV)
     # Class aware masks
-    # mrcnn_mask 的 shape 是 (batch_size, num_rois, 28, 28, num_classes)
+    # mrcnn_mask 的 shape 是 (batch_size, num_train_rois, 28, 28, dataset.num_classes)
+    # mask_specific 的 shape 是 (num_train_rois, 28, 28, dataset.num_classes)
     mask_specific = mrcnn_mask[b, np.arange(mrcnn_mask.shape[1]), :, :, mrcnn_class_ids[b]]
 
     visualize.draw_rois(sample_image, rois[b], refined_rois, mask_specific, mrcnn_class_ids[b], dataset.class_names)
@@ -303,7 +310,7 @@ def show_rois():
 # show_rois()
 
 
-def show_roi_with_mask():
+def show_roi_and_mask():
     g, num_random_rois, detection_targets = create_data_generator()
     [normalized_images, image_meta, rpn_match, rpn_bbox, gt_class_ids, gt_boxes, gt_masks, rpn_rois, rois], \
     [mrcnn_class_ids, mrcnn_bbox, mrcnn_mask] = next(g)
@@ -317,17 +324,20 @@ def show_roi_with_mask():
     # Class aware bboxes
     # mrcnn_bbox 的 shape 是 (batch_size,num_rois,num_classes,4)
     # mrcnn_class_idx 的 shape 是 (batch_size, num_rois)
+    # bbox_specific 的 shape 是 (num_train_rois, dataset.num_classes, 4)
     bbox_specific = mrcnn_bbox[b, np.arange(mrcnn_bbox.shape[1]), mrcnn_class_ids[b], :]
     # Refined ROIs
     refined_rois = utils.apply_box_deltas(rois[b].astype(np.float32), bbox_specific[:, :4] * config.BBOX_STD_DEV)
     # Class aware masks
     # mrcnn_mask 的 shape 是 (batch_size, num_rois, 28, 28, num_classes)
+    # mask_specific 的 shape 是 (num_train_rois, 28, 28, dataset.num_classes)
     mask_specific = mrcnn_mask[b, np.arange(mrcnn_mask.shape[1]), :, :, mrcnn_class_ids[b]]
     # Dispalay ROIs and corresponding masks and bounding boxes
     ids = random.sample(range(rois.shape[1]), 8)
     images = []
     titles = []
     for i in ids:
+        # 这里的 copy() 是为了在这个循环中的多个 id 互不影响
         image = visualize.draw_box(sample_image.copy(), rois[b, i, :4].astype(np.int32), [255, 0, 0])
         image = visualize.draw_box(image, refined_rois[i].astype(np.int64), [0, 255, 0])
         images.append(image)
@@ -338,13 +348,13 @@ def show_roi_with_mask():
     display_images(images, titles, cols=4, cmap="Blues", interpolation="none")
 
 
-# show_roi_with_mask()
+# show_roi_and_mask()
 
 
 def check_ratio_of_positive_rois(num_random_rois):
     # Check ratio of positive ROIs in a set of images.
     limit = 10
-    temp_g = modellib.data_generator(dataset, config, shuffle=True, random_rois=num_random_rois, batch_size=1,
+    temp_g = modellib.data_generator(dataset, config, shuffle=True, num_random_rois=num_random_rois, batch_size=1,
                                      detection_targets=True)
     total = 0
     for i in range(limit):
@@ -354,4 +364,5 @@ def check_ratio_of_positive_rois(num_random_rois):
         print("{:5} {:5.2f}".format(positive_rois, positive_rois / mrcnn_class_ids.shape[1]))
     print("Average percent: {:.2f}".format(total / (limit * mrcnn_class_ids.shape[1])))
 
-# check_ratio_of_positive_rois(num_random_rois=10000)
+
+check_ratio_of_positive_rois(num_random_rois=10000)

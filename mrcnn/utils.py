@@ -106,7 +106,7 @@ def compute_overlaps(boxes1, boxes2):
     for i in range(overlaps.shape[1]):
         box2 = boxes2[i]
         overlaps[:, i] = compute_iou(box2, boxes1, area2[i], area1)
-    # 返回的是所有的 anchors 和所有 gt_bboxes 的 iou
+    # overlaps 的 shape 是 (num_anchors, num_gt_bboxes),是所有的 anchors 和所有 gt_bboxes 的 iou
     # 每一行表示某个 anchor 和所有 gt_bboxes 的 iou
     # 每一列表示某个 gt_bbox 和所有 anchors 的 iou
     return overlaps
@@ -223,8 +223,7 @@ def box_refinement_graph(box, gt_box):
 
 def box_refinement(box, gt_box):
     """Compute refinement needed to transform box to gt_box.
-    box and gt_box are [N, (y1, x1, y2, x2)]. (y2, x2) is
-    assumed to be outside the box.
+    box and gt_box are [N, (y1, x1, y2, x2)]. (y2, x2) is assumed to be outside the box.
     """
     box = box.astype(np.float32)
     gt_box = gt_box.astype(np.float32)
@@ -615,29 +614,47 @@ def generate_anchors(scales, ratios, shape, feature_stride, anchor_stride):
     # Get all combinations of scales and ratios
     # 假设 meshgrid 第一个参数的 shape 是 (m,) 第二个参数的 shape 是 (n,),那么生成的两个结果的 shape 都是 (n,m)
     # 结果的第一个元素的每一行都和第一个参数一样,结果的第二个元素的每一列都和第二个参数一样
+    # 这里传进来的 scales 其实是一个 int, 如 32.经 np.array() 竟然可以接收整数,还能被 meshgrid 使用
     scales, ratios = np.meshgrid(np.array(scales), np.array(ratios))
+    # 如 [32,32,32]
     scales = scales.flatten()
+    # 如 [0.5,1,2]
     ratios = ratios.flatten()
 
     # Enumerate heights and widths from scales and ratios
+    # 如 [45.254834 32.       22.627417]
     heights = scales / np.sqrt(ratios)
+    # 如 [22.627417 32.       45.254834]
     widths = scales * np.sqrt(ratios)
 
     # Enumerate shifts in feature space
+    # 如 np.array([0,4,8...1020])
     shifts_y = np.arange(0, shape[0], anchor_stride) * feature_stride
+    # 如 np.array([0,4,8...1020])
     shifts_x = np.arange(0, shape[1], anchor_stride) * feature_stride
+    # 如 np.array([0,4,8...1020],[0,4,8...1020]...),np.array([0,0,0...0],[4,4,4...4],...[1020,1020,1020...1020])
     shifts_x, shifts_y = np.meshgrid(shifts_x, shifts_y)
 
     # Enumerate combinations of shifts, widths, and heights
+    # 如 box_widths: [[22.627417 32.       45.254834],[22.627417 32.       45.254834]...[22.627417 32.       45.254834]]
+    # shape 为 (65536, 3), 可以试着认为先把 shifts_x 转为一维数组那么其 shape 是 (65536,), 然后再进行 meshgrid
+    # 如 box_centers_x: [[0,0,0],[4,4,4],...,[1020,1020,1020],...,[0,0,0],[4,4,4],...,[1020,1020,1020]]
     box_widths, box_centers_x = np.meshgrid(widths, shifts_x)
+    # 如 box_heights:[[45.254834 32.       22.627417],[45.254834 32.       22.627417],...[45.254834 32.       22.627417]]
+    # shape 为 (65536, 3)
+    # 如 box_centers_y: [[0,0,0],[0,0,0],...,[4,4,4],[4,4,4],...,[1020,1020,1020],[1020,1020,1020]]
     box_heights, box_centers_y = np.meshgrid(heights, shifts_y)
 
     # Reshape to get a list of (y, x) and a list of (h, w)
+    # stack 后 shape 为 (65536,3,2), reshape 后 shape 为 (65536 * 3, 2)
+    # 如 [[0,0],[0,0],[0,0],[0,4],[0,4],[0,4],...,[0,1020],[0,1020],[0,1020],...,[4,0],[4,0],[4,0],...,]
     box_centers = np.stack(
         [box_centers_y, box_centers_x], axis=2).reshape([-1, 2])
+    # 如 [[45,22],[32,32],[22,45],...,[45,22],[32,32],[22,45]]
     box_sizes = np.stack([box_heights, box_widths], axis=2).reshape([-1, 2])
 
     # Convert to corner coordinates (y1, x1, y2, x2)
+    # box_centers 和 box_sizes 的 shape 都为 (65535 * 3,2), concatenate 之后 shape 变为 (65536 * 3, 4)
     boxes = np.concatenate([box_centers - 0.5 * box_sizes,
                             box_centers + 0.5 * box_sizes], axis=1)
     return boxes
@@ -650,7 +667,7 @@ def generate_pyramid_anchors(scales, ratios, feature_shapes, feature_strides,
     all levels of the pyramid.
     scales: config.RPN_ANCHOR_SCALES=(32, 64, 128, 256, 512)
     ratios: config.RPN_ANCHOR_RATIOS=[0.5, 1, 2]
-    feature_shapes: backbone_shapes=(1024//4,1024//8,1024//16,1024//32,1024//64)
+    feature_shapes: backbone_shapes=np.array([[1024//4,1024//4],[1024//8,1024//8],[1024//16,1024//16],[1024//32,1024//32],[1024//64,1024//64]])
     feature_strides: config.BACKBONE_STRIDES=[4, 8, 16, 32, 64]
     anchor_stride: config.RPN_ANCHOR_STRIDE=1
 

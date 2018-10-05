@@ -43,13 +43,13 @@ def display_images(images, titles=None, cols=4, cmap=None, norm=None,
     interpolation: Optional. Image interpolation to use for display.
     """
     titles = titles if titles is not None else [""] * len(images)
-    rows = len(images) // cols
+    rows = len(images) // cols + 1
     plt.figure(figsize=(14, 14 * rows // cols))
     i = 1
     for image, title in zip(images, titles):
         plt.subplot(rows, cols, i)
         plt.title(title, fontsize=9)
-        plt.axis('off')
+        # plt.axis('off')
         plt.imshow(image.astype(np.uint8), cmap=cmap, norm=norm, interpolation=interpolation)
         i += 1
     plt.show()
@@ -209,8 +209,8 @@ def display_differences(image,
 
 def draw_rois(image, rois, refined_rois, mask, class_ids, class_names, limit=10):
     """
-    anchors: [n, (y1, x1, y2, x2)] list of anchors in image coordinates.
-    proposals: [n, 4] the same anchors but refined to fit objects better.
+    rois: [n, (y1, x1, y2, x2)] list of rois in image coordinates.
+    refined_rois: [n, (y1, x1, y2, x2)] the same rois but refined to fit objects better.
     """
     masked_image = image.copy()
 
@@ -220,15 +220,14 @@ def draw_rois(image, rois, refined_rois, mask, class_ids, class_names, limit=10)
 
     fig, ax = plt.subplots(1, figsize=(12, 12))
     if rois.shape[0] > limit:
-        plt.title("Showing {} random ROIs out of {}".format(
-            len(ids), rois.shape[0]))
+        plt.title("Showing {} random ROIs out of {}".format(len(ids), rois.shape[0]))
     else:
         plt.title("{} ROIs".format(len(ids)))
 
     # Show area outside image boundaries.
     ax.set_ylim(image.shape[0] + 20, -20)
     ax.set_xlim(-50, image.shape[1] + 20)
-    ax.axis('off')
+    # ax.axis('off')
 
     for i, id in enumerate(ids):
         color = np.random.rand(3)
@@ -250,12 +249,10 @@ def draw_rois(image, rois, refined_rois, mask, class_ids, class_names, limit=10)
 
             # Label
             label = class_names[class_id]
-            ax.text(rx1, ry1 + 8, "{}".format(label),
-                    color='w', size=11, backgroundcolor="none")
+            ax.text(rx1, ry1 + 8, "{}".format(label), color='green', size=11, backgroundcolor="none")
 
             # Mask
-            m = utils.unmold_mask(mask[id], rois[id]
-                                  [:4].astype(np.int32), image.shape)
+            m = utils.unmold_mask(mask[id], rois[id][:4].astype(np.int32), image.shape)
             masked_image = apply_mask(masked_image, m, color)
 
     ax.imshow(masked_image)
@@ -395,8 +392,7 @@ def draw_boxes(image, boxes=None, refined_boxes=None,
     margin = image.shape[0] // 10
     ax.set_ylim(image.shape[0] + margin, -margin)
     ax.set_xlim(-margin, image.shape[1] + margin)
-    ax.axis('off')
-
+    # ax.axis('off')
     ax.set_title(title)
 
     masked_image = image.astype(np.uint32).copy()
