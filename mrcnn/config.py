@@ -217,14 +217,20 @@ class Config(object):
 
         # Input image size
         if self.IMAGE_RESIZE_MODE == "crop":
-            self.IMAGE_SHAPE = np.array([self.IMAGE_MIN_DIM, self.IMAGE_MIN_DIM,
-                self.IMAGE_CHANNEL_COUNT])
+            self.IMAGE_SHAPE = np.array([self.IMAGE_MIN_DIM, self.IMAGE_MIN_DIM, self.IMAGE_CHANNEL_COUNT])
         else:
-            self.IMAGE_SHAPE = np.array([self.IMAGE_MAX_DIM, self.IMAGE_MAX_DIM,
-                self.IMAGE_CHANNEL_COUNT])
+            self.IMAGE_SHAPE = np.array([self.IMAGE_MAX_DIM, self.IMAGE_MAX_DIM, self.IMAGE_CHANNEL_COUNT])
 
         # Image meta data length
         # See compose_image_meta() for details
+        # meta = np.array(
+        #     [image_id] +                  # size=1
+        #     list(original_image_shape) +  # size=3
+        #     list(image_shape) +           # size=3
+        #     list(window) +                # size=4 (y1, x1, y2, x2) in image cooredinates
+        #     [scale] +                     # size=1
+        #     list(active_class_ids)        # size=num_classes
+        # )
         self.IMAGE_META_SIZE = 1 + 3 + 3 + 4 + 1 + self.NUM_CLASSES
 
     def display(self):

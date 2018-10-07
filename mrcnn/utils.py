@@ -862,21 +862,23 @@ def batch_slice(inputs, graph_fn, batch_size, names=None):
 
     outputs = []
     for i in range(batch_size):
+        # 取第 i 个 batch item 的数据
+        # 如 inputs 的两个元素原来的 shape 分别是 (1,261888,4) 和 (1,config.PRE_NMS_LIMIT)
+        # 会变成 (261888,4) 和 (config.PRE_NMS_LIMIT,)
         inputs_slice = [x[i] for x in inputs]
+        # 如 graph_fn 为 lambda x,y : tf.gather(x,y),就是 input_slice 第二个元素作为第一个元素的下标,获取相应的元素
         output_slice = graph_fn(*inputs_slice)
         if not isinstance(output_slice, (tuple, list)):
             output_slice = [output_slice]
         outputs.append(output_slice)
-    # Change outputs from a list of slices where each is
-    # a list of outputs to a list of outputs and each has
-    # a list of slices
+    # Change outputs from a list of slices where each is a list of outputs
+    # to a list of outputs and each has a list of slices
     outputs = list(zip(*outputs))
 
     if names is None:
         names = [None] * len(outputs)
 
-    result = [tf.stack(o, axis=0, name=n)
-              for o, n in zip(outputs, names)]
+    result = [tf.stack(o, axis=0, name=n) for o, n in zip(outputs, names)]
     if len(result) == 1:
         result = result[0]
 

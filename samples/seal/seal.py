@@ -37,7 +37,7 @@ import cv2
 
 # Root directory of the project
 ROOT_DIR = os.path.abspath("../../")
-
+SEAL_DIR = os.path.join(ROOT_DIR, 'samples', 'seal')
 # Import Mask RCNN
 sys.path.append(ROOT_DIR)  # To find local version of the library
 from mrcnn.config import Config
@@ -48,7 +48,7 @@ COCO_WEIGHTS_PATH = os.path.join(ROOT_DIR, "mask_rcnn_coco.h5")
 
 # Directory to save logs and model checkpoints, if not provided
 # through the command line argument --logs
-DEFAULT_LOGS_DIR = os.path.join(ROOT_DIR, "logs")
+DEFAULT_LOGS_DIR = os.path.join(SEAL_DIR, "logs")
 
 ############################################################
 #  Configurations
@@ -60,7 +60,7 @@ class SealConfig(Config):
     Derives from the base Config class and overrides some values.
     """
     # Give the configuration a recognizable name
-    NAME = "seal"
+    NAME = "seals"
 
     # We use a GPU with 12GB memory, which can fit two images.
     # Adjust down if you use a smaller GPU.
@@ -195,10 +195,7 @@ def train(model):
     # COCO trained weights, we don't need to train too long. Also,
     # no need to train all layers, just the heads should do it.
     print("Training network heads")
-    model.train(dataset_train, dataset_val,
-                learning_rate=config.LEARNING_RATE,
-                epochs=30,
-                layers='heads')
+    model.train(dataset_train, dataset_val, learning_rate=config.LEARNING_RATE, epochs=30, layers='heads')
 
 
 def color_splash(image, mask):
@@ -328,11 +325,9 @@ if __name__ == '__main__':
 
     # Create model
     if args.command == "train":
-        model = modellib.MaskRCNN(mode="training", config=config,
-                                  model_dir=args.logs)
+        model = modellib.MaskRCNN(mode="training", config=config, model_dir=args.logs)
     else:
-        model = modellib.MaskRCNN(mode="inference", config=config,
-                                  model_dir=args.logs)
+        model = modellib.MaskRCNN(mode="inference", config=config, model_dir=args.logs)
 
     # Select weights file to load
     if args.weights.lower() == "coco":
@@ -364,8 +359,6 @@ if __name__ == '__main__':
     if args.command == "train":
         train(model)
     elif args.command == "splash":
-        detect_and_color_splash(model, image_path=args.image,
-                                video_path=args.video)
+        detect_and_color_splash(model, image_path=args.image, video_path=args.video)
     else:
-        print("'{}' is not recognized. "
-              "Use 'train' or 'splash'".format(args.command))
+        print("'{}' is not recognized.Use 'train' or 'splash'".format(args.command))
