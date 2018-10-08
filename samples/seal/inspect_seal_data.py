@@ -307,7 +307,7 @@ def show_rois():
     plt.show()
 
 
-# show_rois()
+show_rois()
 
 
 def show_roi_and_mask():
@@ -365,4 +365,4 @@ def check_ratio_of_positive_rois(num_random_rois):
     print("Average percent: {:.2f}".format(total / (limit * mrcnn_class_ids.shape[1])))
 
 
-check_ratio_of_positive_rois(num_random_rois=10000)
+# check_ratio_of_positive_rois(num_random_rois=10000)

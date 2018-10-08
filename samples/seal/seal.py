@@ -50,6 +50,7 @@ COCO_WEIGHTS_PATH = os.path.join(ROOT_DIR, "mask_rcnn_coco.h5")
 # through the command line argument --logs
 DEFAULT_LOGS_DIR = os.path.join(SEAL_DIR, "logs")
 
+
 ############################################################
 #  Configurations
 ############################################################
@@ -127,21 +128,17 @@ class SealDataset(utils.Dataset):
             if type(a['regions']) is dict:
                 polygons = [r['shape_attributes'] for r in a['regions'].values()]
             else:
-                polygons = [r['shape_attributes'] for r in a['regions']] 
+                polygons = [r['shape_attributes'] for r in a['regions']]
 
-            # load_mask() needs the image size to convert polygons to masks.
+                # load_mask() needs the image size to convert polygons to masks.
             # Unfortunately, VIA doesn't include it in JSON, so we must read
             # the image. This is only managable since the dataset is tiny.
             image_path = os.path.join(dataset_dir, a['filename'])
             image = cv2.imread(image_path)
             height, width = image.shape[:2]
 
-            self.add_image(
-                "seal",
-                image_id=a['filename'],  # use file name as a unique image id
-                path=image_path,
-                width=width, height=height,
-                polygons=polygons)
+            self.add_image("seal", image_id=a['filename'],  # use file name as a unique image id
+                           path=image_path, width=width, height=height, polygons=polygons)
 
     def load_mask(self, image_id):
         """Generate instance masks for an image.
@@ -320,6 +317,8 @@ if __name__ == '__main__':
             # one image at a time. Batch size = GPU_COUNT * IMAGES_PER_GPU
             GPU_COUNT = 1
             IMAGES_PER_GPU = 1
+
+
         config = InferenceConfig()
     config.display()
 

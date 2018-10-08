@@ -238,8 +238,17 @@ def apply_box_deltas_graph(boxes, deltas):
 
 def clip_boxes_graph(boxes, window):
     """
+    此函数的作用我猜是对已经修改过的 bbox 进行再修正, 以确保坐标都在 normalized coordinate 里面
+    normalized coordinates 左下角的坐标为 (0,0), 右上角的坐标为 (1,1)
     boxes: [N, (y1, x1, y2, x2)]
-    window: [4] in the form y1, x1, y2, x2
+    window: [4] in the form wy1, wx1, wy2, wx2
+                   __________(wy2,wx2)
+                  |          |
+            ______|______    |
+           |      |clip |    |
+           |      |_____|____|
+           |            |
+    (y1,x1)|____________|
     """
     # Split
     wy1, wx1, wy2, wx2 = tf.split(window, 4)
@@ -264,6 +273,7 @@ class ProposalLayer(KE.Layer):
         rpn_probs: [batch, num_anchors, (bg prob, fg prob)]
         rpn_bbox: [batch, num_anchors, (dy, dx, log(dh), log(dw))]
         anchors: [batch, num_anchors, (y1, x1, y2, x2)] anchors in normalized coordinates
+                 在 self.get_anchors() 调整成 normalized coordinates 坐标
 
     Returns:
         Proposals in normalized coordinates [batch, rois, (y1, x1, y2, x2)]
@@ -272,6 +282,7 @@ class ProposalLayer(KE.Layer):
     def __init__(self, proposal_count, nms_threshold, config=None, **kwargs):
         super(ProposalLayer, self).__init__(**kwargs)
         self.config = config
+        # config.POST_NMS_ROIS_TRAINING 或 config.POST_NMS_ROIS_INFERENCE
         self.proposal_count = proposal_count
         self.nms_threshold = nms_threshold
 
@@ -301,14 +312,14 @@ class ProposalLayer(KE.Layer):
                                             names=["pre_nms_anchors"])
 
         # Apply deltas to anchors to get refined anchors.
-        # [batch, N, (y1, x1, y2, x2)]
+        # [batch, config.PRE_NMS_LIMIT, (y1, x1, y2, x2)]
         boxes = utils.batch_slice([pre_nms_anchors, deltas],
                                   lambda x, y: apply_box_deltas_graph(x, y),
                                   self.config.IMAGES_PER_GPU,
                                   names=["refined_anchors"])
 
         # Clip to image boundaries. Since we're in normalized coordinates,
-        # clip to 0..1 range. [batch, N, (y1, x1, y2, x2)]
+        # clip to 0..1 range. [batch, config.PRE_NMS_LIMIT, (y1, x1, y2, x2)]
         window = np.array([0, 0, 1, 1], dtype=np.float32)
         boxes = utils.batch_slice(boxes,
                                   lambda x: clip_boxes_graph(x, window),
@@ -325,12 +336,14 @@ class ProposalLayer(KE.Layer):
                 self.nms_threshold, name="rpn_non_max_suppression")
             proposals = tf.gather(boxes, indices)
             # Pad if needed
+            # 如果得到的 proposals 的个数小于 self.proposal_count,用 0 来填充
             padding = tf.maximum(self.proposal_count - tf.shape(proposals)[0], 0)
+            # tf.pad 的第二个参数的 shape 为 (n_dims, 2), 每一个数表示的填充 0 的长度
+            # 如第一个元素的两个数分别表示在第一维的开始处不填充, 在第一维度末尾填充长度为 padding 的 0
             proposals = tf.pad(proposals, [(0, padding), (0, 0)])
             return proposals
 
-        proposals = utils.batch_slice([boxes, scores], nms,
-                                      self.config.IMAGES_PER_GPU)
+        proposals = utils.batch_slice([boxes, scores], nms, self.config.IMAGES_PER_GPU)
         return proposals
 
     def compute_output_shape(self, input_shape):

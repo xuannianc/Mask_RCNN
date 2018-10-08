@@ -867,17 +867,21 @@ def batch_slice(inputs, graph_fn, batch_size, names=None):
         # 会变成 (261888,4) 和 (config.PRE_NMS_LIMIT,)
         inputs_slice = [x[i] for x in inputs]
         # 如 graph_fn 为 lambda x,y : tf.gather(x,y),就是 input_slice 第二个元素作为第一个元素的下标,获取相应的元素
+        # 如 output_slice 的 shape 会变成 (config.PRE_NMS_LIMIT, 4)
         output_slice = graph_fn(*inputs_slice)
         if not isinstance(output_slice, (tuple, list)):
             output_slice = [output_slice]
         outputs.append(output_slice)
     # Change outputs from a list of slices where each is a list of outputs
     # to a list of outputs and each has a list of slices
+    # 假设 batch_size > 1, outputs 原来为 [[output_slice_batch_item_1],[output_slice_batch_item_2],...,]
+    # 转换之后变为 [(output_slice_batch_item_1,output_slice_batch_item_2)]
+    # 但是为什么要这么转换?
     outputs = list(zip(*outputs))
 
     if names is None:
         names = [None] * len(outputs)
-
+    # 按照上面的假设, tf.stack 的结果的 shape 是 (batch_size, config.PRE_NMS_LIMIT, 4)
     result = [tf.stack(o, axis=0, name=n) for o, n in zip(outputs, names)]
     if len(result) == 1:
         result = result[0]
@@ -903,11 +907,11 @@ def norm_boxes(boxes, shape):
     boxes: [N, (y1, x1, y2, x2)] in pixel coordinates
     shape: [..., (height, width)] in pixels
 
-    Note: In pixel coordinates (y2, x2) is outside the box. But in normalized
-    coordinates it's inside the box.
+    Note: In pixel coordinates (y2, x2) is outside the box. But in normalized coordinates it's inside the box.
 
     Returns:
         [N, (y1, x1, y2, x2)] in normalized coordinates
+        这里的 normalized coordinates 是左上角 (0,0), 右下角 (1,1) 吗?
     """
     h, w = shape
     scale = np.array([h - 1, w - 1, h - 1, w - 1])
