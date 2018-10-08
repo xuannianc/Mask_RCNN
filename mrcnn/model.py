@@ -480,8 +480,17 @@ def overlaps_graph(boxes1, boxes2):
     # every boxes1 against every boxes2 without loops.
     # TF doesn't have an equivalent to np.repeat() so simulate it
     # using tf.tile() and tf.reshape.
-    b1 = tf.reshape(tf.tile(tf.expand_dims(boxes1, 1),
-                            [1, 1, tf.shape(boxes2)[0]]), [-1, 4])
+    # 假设 boxes1 的 shape 为 (num_proposals, 4), boxes2 的 shape 为 (num_gt_bboxes, 4)
+    # expand_dims 后变成 (num_proposals, 1, 4), 我怎么感觉 expand_dims 这一步可以省啊
+    # tile 之后变成 (num_proposals, 1, 4 * num_gt_bbox)
+    # reshape 之后变成 (num_proposals * num_gt_bboxes, 4)
+    # 每个 proposal 重复了 num_gt_bboxes 次
+    # 如 [[1,2,3,4],[5,6,7,8],[9,10,11,12]] 变成 [[1,2,3,4,1,2,3,4],[5,6,7,8,5,6,7,8],[9,10,11,12,9,10,11,12]]
+    # 再变成 [[1,2,3,4],[1,2,3,4],[5,6,7,8],[5,6,7,8],[9,10,11,12],[9,10,11,12]]
+    b1 = tf.reshape(tf.tile(tf.expand_dims(boxes1, 1), [1, 1, tf.shape(boxes2)[0]]), [-1, 4])
+    # b2 的 shape (num_gt_bboxes * num_proposals, 4), 每个 gt_bbox 重复了 num_proposals 次
+    # 如 [[11,12,13,14],[15,16,17,18]] 变成
+    # [[11,12,13,14],[15,16,17,18],[11,12,13,14],[15,16,17,18],[11,12,13,14],[15,16,17,18]]
     b2 = tf.tile(boxes2, [tf.shape(boxes1)[0], 1])
     # 2. Compute intersections
     b1_y1, b1_x1, b1_y2, b1_x2 = tf.split(b1, 4, axis=1)
@@ -497,6 +506,11 @@ def overlaps_graph(boxes1, boxes2):
     union = b1_area + b2_area - intersection
     # 4. Compute IoU and reshape to [boxes1, boxes2]
     iou = intersection / union
+    # iou 的 shape 是 (num_proposals * num_gt_bboxes,), 0-(num_gt_bboxes-1) 个元素表示第 0 个 proposal 和所有 gt_bbox 的 iou
+    # reshape 之后会变成 axis=1 的第 0 个元素
+    # 同理, num_gt_bboxes - (2 * num_gt_bboxes - 1) 的元素表示第 1 个 proposal 和所有 gt_bbox 的 iou
+    # reshape 之后会变成 axis=1 的第 1 个元素
+    # 如 iou 为 [0.1,0.2,0.3,0.4,0.5,0.6] reshape 成 shape (2,3) 就是 [[0.1,0.2],[0.3,0.4],[0.5,0.6]]
     overlaps = tf.reshape(iou, [tf.shape(boxes1)[0], tf.shape(boxes2)[0]])
     return overlaps
 
@@ -507,8 +521,8 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
 
     Inputs:
 
-    proposals: [config.POST_NMS_ROIS_TRAINING, (y1, x1, y2, x2)] in normalized coordinates. Might
-               be zero padded if there are not enough proposals.
+    proposals: [config.POST_NMS_ROIS_TRAINING, (y1, x1, y2, x2)] in normalized coordinates.
+               Might be zero padded if there are not enough proposals.
     gt_class_ids: [config.MAX_GT_INSTANCES] int class IDs
     gt_boxes: [config.MAX_GT_INSTANCES, (y1, x1, y2, x2)] in normalized coordinates.
     gt_masks: [height, width, config.MAX_GT_INSTANCES] of boolean type.
@@ -536,6 +550,7 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     proposals, _ = trim_zeros_graph(proposals, name="trim_proposals")
     gt_boxes, non_zeros = trim_zeros_graph(gt_boxes, name="trim_gt_boxes")
     gt_class_ids = tf.boolean_mask(gt_class_ids, non_zeros, name="trim_gt_class_ids")
+    # tf.where 返回 non_zeros 中 True 的下标
     gt_masks = tf.gather(gt_masks, tf.where(non_zeros)[:, 0], axis=2, name="trim_gt_masks")
 
     # Handle COCO crowds
@@ -555,6 +570,7 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     # Compute overlaps with crowd boxes [proposals, crowd_boxes]
     crowd_overlaps = overlaps_graph(proposals, crowd_boxes)
     crowd_iou_max = tf.reduce_max(crowd_overlaps, axis=1)
+    # 表示非 crowd box?
     no_crowd_bool = (crowd_iou_max < 0.001)
 
     # Determine positive and negative ROIs
@@ -567,9 +583,10 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
 
     # Subsample ROIs. Aim for 33% positive
     # Positive ROIs
-    positive_count = int(config.TRAIN_ROIS_PER_IMAGE *
-                         config.ROI_POSITIVE_RATIO)
+    positive_count = int(config.TRAIN_ROIS_PER_IMAGE * config.ROI_POSITIVE_RATIO)
+    # 注意: 这种切片索引方式 a[:b], 如果 a 的长度小于 b, 不会报错, 而是返回完成的 a
     positive_indices = tf.random_shuffle(positive_indices)[:positive_count]
+    # 重新确认 positive proposals 的个数
     positive_count = tf.shape(positive_indices)[0]
     # Negative ROIs. Add enough to maintain positive:negative ratio.
     r = 1.0 / config.ROI_POSITIVE_RATIO
@@ -614,9 +631,7 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
         x2 = (x2 - gt_x1) / gt_w
         boxes = tf.concat([y1, x1, y2, x2], 1)
     box_ids = tf.range(0, tf.shape(roi_masks)[0])
-    masks = tf.image.crop_and_resize(tf.cast(roi_masks, tf.float32), boxes,
-                                     box_ids,
-                                     config.MASK_SHAPE)
+    masks = tf.image.crop_and_resize(tf.cast(roi_masks, tf.float32), boxes, box_ids, config.MASK_SHAPE)
     # Remove the extra dimension from masks.
     masks = tf.squeeze(masks, axis=3)
 
@@ -2836,6 +2851,7 @@ def trim_zeros_graph(boxes, name=None):
     non_zeros: [N] a 1D boolean mask identifying the rows to keep
     """
     non_zeros = tf.cast(tf.reduce_sum(tf.abs(boxes), axis=1), tf.bool)
+    # non_zeros 作为 mask, 获取 boxes 中对应 mask 为 True 的 item
     boxes = tf.boolean_mask(boxes, non_zeros, name=name)
     return boxes, non_zeros
 
