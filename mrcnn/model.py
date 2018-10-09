@@ -356,6 +356,7 @@ class ProposalLayer(KE.Layer):
 
 def log2_graph(x):
     """Implementation of Log2. TF doesn't have a native implementation."""
+    # 换底公式
     return tf.log(x) / tf.log(2.0)
 
 
@@ -366,9 +367,8 @@ class PyramidROIAlign(KE.Layer):
     - pool_shape: [pool_height, pool_width] of the output pooled regions. Usually [7, 7]
 
     Inputs:
-    - boxes: [batch, num_boxes, (y1, x1, y2, x2)] in normalized
-             coordinates. Possibly padded with zeros if not enough
-             boxes to fill the array.
+    - boxes: [batch, num_boxes, (y1, x1, y2, x2)] in normalized coordinates.
+             Possibly padded with zeros if not enough boxes to fill the array.
     - image_meta: [batch, (meta data)] Image details. See compose_image_meta()
     - feature_maps: List of feature maps from different levels of the pyramid.
                     Each is [batch, height, width, channels]
@@ -384,78 +384,96 @@ class PyramidROIAlign(KE.Layer):
         self.pool_shape = tuple(pool_shape)
 
     def call(self, inputs):
-        # Crop boxes [batch, num_boxes, (y1, x1, y2, x2)] in normalized coords
+        # Crop boxes [batch_size, num_boxes, (y1, x1, y2, x2)] in normalized coords
         boxes = inputs[0]
 
         # Image meta
         # Holds details about the image. See compose_image_meta()
+        # (batch_size, image_meta_size=14)
         image_meta = inputs[1]
 
-        # Feature Maps. List of feature maps from different level of the
-        # feature pyramid. Each is [batch, height, width, channels]
+        # Feature Maps. List of feature maps from different level of the feature pyramid.
+        # Each is [batch_size, height, width, channels]
         feature_maps = inputs[2:]
 
         # Assign each ROI to a level in the pyramid based on the ROI area.
+        # tf.split 参考 https://www.tensorflow.org/api_docs/python/tf/split
+        # y1, x1, y2, x2 的 shape 为 (batch_size, num_boxes, 1)
         y1, x1, y2, x2 = tf.split(boxes, 4, axis=2)
         h = y2 - y1
         w = x2 - x1
         # Use shape of first image. Images in a batch must have the same size.
         image_shape = parse_image_meta_graph(image_meta)['image_shape'][0]
-        # Equation 1 in the Feature Pyramid Networks paper. Account for
-        # the fact that our coordinates are normalized here.
+        # Equation 1 in the Feature Pyramid Networks paper.
+        # Account for the fact that our coordinates are normalized here.
         # e.g. a 224x224 ROI (in pixels) maps to P4
         image_area = tf.cast(image_shape[0] * image_shape[1], tf.float32)
+        # 这里和论文中唯一的不同就是 224.0/tf.sqrt(image_area) 我想这是因为 rois 都被 normalized 了
         roi_level = log2_graph(tf.sqrt(h * w) / (224.0 / tf.sqrt(image_area)))
-        roi_level = tf.minimum(5, tf.maximum(
-            2, 4 + tf.cast(tf.round(roi_level), tf.int32)))
+        # 这里的 4 是论文中的 k0
+        # roi_level 的 shape 为 (batch_size, num_boxes, 1)
+        roi_level = tf.minimum(5, tf.maximum(2, 4 + tf.cast(tf.round(roi_level), tf.int32)))
+        # roi_level 的 shape 为 (batch_size, num_boxes)
         roi_level = tf.squeeze(roi_level, 2)
 
         # Loop through levels and apply ROI pooling to each. P2 to P5.
         pooled = []
         box_to_level = []
         for i, level in enumerate(range(2, 6)):
+            # ix 是一个二维数组
             ix = tf.where(tf.equal(roi_level, level))
+            # tf.gather_nd 参考 https://www.tensorflow.org/api_docs/python/tf/manip/gather_nd
+            # 当 ix 是一个二维数组, 第二维的长度为 2. 第二维的第一个元素表示 batch_item id, 第二个参数表示 box_id, 组合起来就能获取 box
             level_boxes = tf.gather_nd(boxes, ix)
 
             # Box indices for crop_and_resize.
+            # box_indices 就是该 level 所有的 box 对应的 batch_item_id
+            # box_indices 的 shape 是 (num_level_bboxes,)
             box_indices = tf.cast(ix[:, 0], tf.int32)
 
             # Keep track of which box is mapped to which level
             box_to_level.append(ix)
 
             # Stop gradient propogation to ROI proposals
+            # 目前对 tf.stop_gradient 还不了解
             level_boxes = tf.stop_gradient(level_boxes)
             box_indices = tf.stop_gradient(box_indices)
 
             # Crop and Resize
-            # From Mask R-CNN paper: "We sample four regular locations, so
-            # that we can evaluate either max or average pooling. In fact,
-            # interpolating only a single value at each bin center (without
-            # pooling) is nearly as effective."
+            # From Mask R-CNN paper: "We sample four regular locations,
+            # so that we can evaluate either max or average pooling.
+            # In fact, interpolating only a single value at each bin center (without pooling) is nearly as effective."
             #
             # Here we use the simplified approach of a single value per bin,
             # which is how it's done in tf.crop_and_resize()
             # Result: [batch * num_boxes, pool_height, pool_width, channels]
-            pooled.append(tf.image.crop_and_resize(
-                feature_maps[i], level_boxes, box_indices, self.pool_shape,
-                method="bilinear"))
+            # level_boxes 是 normalized 的, 而 feature_maps 是 pixel based 的, 这怎么能这样操作?
+            pooled.append(
+                tf.image.crop_and_resize(feature_maps[i], level_boxes, box_indices, self.pool_shape, method="bilinear"))
 
         # Pack pooled features into one tensor
         pooled = tf.concat(pooled, axis=0)
 
-        # Pack box_to_level mapping into one array and add another
-        # column representing the order of pooled boxes
+        # Pack box_to_level mapping into one array and add another column representing the order of pooled boxes
+        # 各个 level 的 bbox 的下标
+        # shape 为 (num_boxes, 2)
         box_to_level = tf.concat(box_to_level, axis=0)
+        # tf.range 参见 https://www.tensorflow.org/api_docs/python/tf/range
         box_range = tf.expand_dims(tf.range(tf.shape(box_to_level)[0]), 1)
-        box_to_level = tf.concat([tf.cast(box_to_level, tf.int32), box_range],
-                                 axis=1)
+        # shape 为 (num_boxes, 3) 第二维增加了一列表示 box 在 box_to_level 中的序号
+        box_to_level = tf.concat([tf.cast(box_to_level, tf.int32), box_range], axis=1)
 
         # Rearrange pooled features to match the order of the original boxes
         # Sort box_to_level by batch then box index
         # TF doesn't have a way to sort by two columns, so merge them and sort.
         sorting_tensor = box_to_level[:, 0] * 100000 + box_to_level[:, 1]
-        ix = tf.nn.top_k(sorting_tensor, k=tf.shape(
-            box_to_level)[0]).indices[::-1]
+        # ix 表示对 sorting_tensor 进行从小到大排序, 当前每个元素在排好序的列表中的 ix 组成的列表
+        # 假设 sorting_tensor 是 [1, 7, 4, 5, 2, 6], 那么 ix [0 4 2 3 5 1]
+        # 但是注意: box_to_level[:,[0,1]] 是 tf.where 返回的第二维数据,本身已经按照先 batch_item_id 后 box_id 排好序了
+        # 再排序似乎毫无意义, 返回的 ix 是 [0,1,...,num_boxes-1]
+        ix = tf.nn.top_k(sorting_tensor, k=tf.shape(box_to_level)[0]).indices[::-1]
+        # box_to_level[:, 2] 表示的是现在 box 的序号, 参数 ix 表示的对 sorting_tensor 排序的 ix
+        # 我觉得这一步是可以省略的
         ix = tf.gather(box_to_level[:, 2], ix)
         pooled = tf.gather(pooled, ix)
 
@@ -465,6 +483,10 @@ class PyramidROIAlign(KE.Layer):
         return pooled
 
     def compute_output_shape(self, input_shape):
+        # input_shape 是所有 input 的 shape 组成的 list
+        # 所以 input_shape 第 0 个元素是 boxes 的 shape 为 (batch_size, num_boxes=200, 4)
+        # input_shape 第 2 个元素是 feature_maps 的 shape[-1] 表示 channels
+        # 综上, 返回的 shape 是 [batch, num_boxes, pool_height, pool_width, channels]
         return input_shape[0][:2] + self.pool_shape + (input_shape[2][-1],)
 
 
@@ -942,11 +964,9 @@ def build_rpn_model(anchor_stride, anchors_per_location, depth):
 def fpn_classifier_graph(rois, feature_maps, image_meta,
                          pool_size, num_classes, train_bn=True,
                          fc_layers_size=1024):
-    """Builds the computation graph of the feature pyramid network classifier
-    and regressor heads.
+    """Builds the computation graph of the feature pyramid network classifier and regressor heads.
 
-    rois: [batch, num_rois, (y1, x1, y2, x2)] Proposal boxes in normalized
-          coordinates.
+    rois: [batch, num_rois, (y1, x1, y2, x2)] Proposal boxes in normalized coordinates.
     feature_maps: List of feature maps from different layers of the pyramid,
                   [P2, P3, P4, P5]. Each has a different resolution.
     image_meta: [batch, (meta data)] Image details. See compose_image_meta()
@@ -958,13 +978,11 @@ def fpn_classifier_graph(rois, feature_maps, image_meta,
     Returns:
         logits: [batch, num_rois, NUM_CLASSES] classifier logits (before softmax)
         probs: [batch, num_rois, NUM_CLASSES] classifier probabilities
-        bbox_deltas: [batch, num_rois, NUM_CLASSES, (dy, dx, log(dh), log(dw))] Deltas to apply to
-                     proposal boxes
+        bbox_deltas: [batch, num_rois, NUM_CLASSES, (dy, dx, log(dh), log(dw))] Deltas to apply to proposal boxes
     """
     # ROI Pooling
     # Shape: [batch, num_rois, POOL_SIZE, POOL_SIZE, channels]
-    x = PyramidROIAlign([pool_size, pool_size],
-                        name="roi_align_classifier")([rois, image_meta] + feature_maps)
+    x = PyramidROIAlign([pool_size, pool_size], name="roi_align_classifier")([rois, image_meta] + feature_maps)
     # Two 1024 FC layers (implemented with Conv2D for consistency)
     x = KL.TimeDistributed(KL.Conv2D(fc_layers_size, (pool_size, pool_size), padding="valid"),
                            name="mrcnn_class_conv1")(x)
@@ -1965,8 +1983,7 @@ class MaskRCNN():
         P3 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (3, 3), padding="SAME", name="fpn_p3")(P3)
         P4 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (3, 3), padding="SAME", name="fpn_p4")(P4)
         P5 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (3, 3), padding="SAME", name="fpn_p5")(P5)
-        # P6 is used for the 5th anchor scale in RPN. Generated by
-        # subsampling from P5 with stride of 2.
+        # P6 is used for the 5th anchor scale in RPN. Generated by subsampling from P5 with stride of 2.
         P6 = KL.MaxPooling2D(pool_size=(1, 1), strides=2, name="fpn_p6")(P5)
 
         # Note that P6 is used in RPN, but not in the classifier heads.

@@ -67,4 +67,26 @@ def test_tf_expand_dims():
         print(sess.run(tf.shape(b)))
 
 
-test_tf_expand_dims()
+# test_tf_expand_dims()
+
+def test_tf_equal():
+    a = np.array([[1, 2, 3, 2]])
+    b = tf.equal(a, 2)
+    c = tf.where(b)
+    with tf.Session() as sess:
+        print(sess.run(b))
+        print(sess.run(c))
+        print(sess.run(c[:, 0]))
+
+
+# test_tf_equal()
+
+def test_tf_nn_top():
+    a = np.array([1, 7, 4, 5, 2, 6])
+    b = tf.nn.top_k(a, k=a.shape[0])
+    with tf.Session() as sess:
+        # [0 4 2 3 5 1]
+        print(sess.run(b.indices[::-1]))
+
+
+test_tf_nn_top()
