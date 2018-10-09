@@ -584,7 +584,7 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     # Subsample ROIs. Aim for 33% positive
     # Positive ROIs
     positive_count = int(config.TRAIN_ROIS_PER_IMAGE * config.ROI_POSITIVE_RATIO)
-    # 注意: 这种切片索引方式 a[:b], 如果 a 的长度小于 b, 不会报错, 而是返回完成的 a
+    # 注意: 这种切片索引方式 a[:b], 如果 a 的长度小于 b, 不会报错, 而是返回完整的 a
     positive_indices = tf.random_shuffle(positive_indices)[:positive_count]
     # 重新确认 positive proposals 的个数
     positive_count = tf.shape(positive_indices)[0]
@@ -612,8 +612,10 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
 
     # Assign positive ROIs to GT masks
     # Permute masks to [N, height, width, 1]
+    # expand_dims 之后可以认为 transposed_masks 变成了 N 个 shape 为 (height,width,1) 的 image 组成的 batch
     transposed_masks = tf.expand_dims(tf.transpose(gt_masks, [2, 0, 1]), -1)
     # Pick the right mask for each ROI
+    # 相当于从 batch 中选择一部分的 image
     roi_masks = tf.gather(transposed_masks, roi_gt_box_assignment)
 
     # Compute mask targets
@@ -631,12 +633,23 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
         x2 = (x2 - gt_x1) / gt_w
         boxes = tf.concat([y1, x1, y2, x2], 1)
     box_ids = tf.range(0, tf.shape(roi_masks)[0])
+    # crop_and_resize 可以完成 RoiPooling 的操作, 参考 https://blog.csdn.net/qq_14839543/article/details/80019951
+    # https://www.tensorflow.org/api_docs/python/tf/image/crop_and_resize
+    # 第一个参数 image, 表示一个 batch 的 image
+    # 第二个参数 boxes, 表示 proposals 的坐标
+    # 第三个参数 box_ind, 表示 batch 中 image 的下标
+    # 第四个参数 crop_size, 表示 crop 和 resize 之后的大小
+    # masks 的 shape 为 (N, height, width, 1)
     masks = tf.image.crop_and_resize(tf.cast(roi_masks, tf.float32), boxes, box_ids, config.MASK_SHAPE)
     # Remove the extra dimension from masks.
+    # tf.squeeze 参考 https://www.tensorflow.org/api_docs/python/tf/squeeze
+    # 就是删除 dim_size=1 的 dim, 可以通过 axis 限制删除的 dim 的范围
+    # masks 的 shape 变为 (N, height, width)
     masks = tf.squeeze(masks, axis=3)
 
-    # Threshold mask pixels at 0.5 to have GT masks be 0 or 1 to use with
-    # binary cross entropy loss.
+    # Threshold mask pixels at 0.5 to have GT masks be 0 or 1 to use with binary cross entropy loss.
+    # tf.round 参考 https://www.tensorflow.org/api_docs/python/tf/round
+    # round 小数到最近的整数, x.5 到最近的偶数, 如 1.5 变成 2.0, 2.5 也变成 2.0
     masks = tf.round(masks)
 
     # Append negative ROIs and pad bbox deltas and masks that
@@ -648,6 +661,7 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     roi_gt_boxes = tf.pad(roi_gt_boxes, [(0, N + P), (0, 0)])
     roi_gt_class_ids = tf.pad(roi_gt_class_ids, [(0, N + P)])
     deltas = tf.pad(deltas, [(0, N + P), (0, 0)])
+    # 需要注意的是 masks 并没有 transpose 过来, 第一维仍表示的是 mask 的个数
     masks = tf.pad(masks, [[0, N + P], (0, 0), (0, 0)])
 
     return rois, roi_gt_class_ids, deltas, masks
@@ -703,10 +717,10 @@ class DetectionTargetLayer(KE.Layer):
             (None, self.config.TRAIN_ROIS_PER_IMAGE, 4),  # rois
             (None, self.config.TRAIN_ROIS_PER_IMAGE),  # class_ids
             (None, self.config.TRAIN_ROIS_PER_IMAGE, 4),  # deltas
-            (None, self.config.TRAIN_ROIS_PER_IMAGE, self.config.MASK_SHAPE[0],
-             self.config.MASK_SHAPE[1])  # masks
+            (None, self.config.TRAIN_ROIS_PER_IMAGE, self.config.MASK_SHAPE[0], self.config.MASK_SHAPE[1])  # masks
         ]
 
+    # 作甚?
     def compute_mask(self, inputs, mask=None):
         return [None, None, None, None]
 
@@ -2014,9 +2028,9 @@ class MaskRCNN():
 
             # Generate detection targets
             # Subsamples proposals and generates target outputs for training
-            # Note that proposal class IDs, gt_boxes, and gt_masks are zero
-            # padded. Equally, returned rois and targets are zero padded.
-            rois, target_class_ids, target_bbox, target_mask = \
+            # Note that proposal class IDs, gt_boxes, and gt_masks are zero padded.
+            # Equally, returned rois and targets are zero padded.
+            rois, target_class_ids, target_deltas, target_mask = \
                 DetectionTargetLayer(config, name="proposal_targets")([
                     target_rois, input_gt_class_ids, gt_boxes, input_gt_masks])
 
@@ -2045,7 +2059,7 @@ class MaskRCNN():
             class_loss = KL.Lambda(lambda x: mrcnn_class_loss_graph(*x), name="mrcnn_class_loss")(
                 [target_class_ids, mrcnn_class_logits, active_class_ids])
             bbox_loss = KL.Lambda(lambda x: mrcnn_bbox_loss_graph(*x), name="mrcnn_bbox_loss")(
-                [target_bbox, target_class_ids, mrcnn_bbox])
+                [target_deltas, target_class_ids, mrcnn_bbox])
             mask_loss = KL.Lambda(lambda x: mrcnn_mask_loss_graph(*x), name="mrcnn_mask_loss")(
                 [target_mask, target_class_ids, mrcnn_mask])
 
