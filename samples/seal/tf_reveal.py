@@ -89,4 +89,20 @@ def test_tf_nn_top():
         print(sess.run(b.indices[::-1]))
 
 
-test_tf_nn_top()
+# test_tf_nn_top()
+
+def test_tf_gather():
+    """
+    indices ndims=2 的情况
+    :return:
+    """
+    a = np.array([1, 1, 0])
+    b = np.array([[0, 1, 0, 0, 0], [1, 1, 1, 0, 2]])
+
+    with tf.Session() as sess:
+        # [[1 1 1 1 1]
+        #  [1 1 1 1 0]]
+        print(sess.run(tf.gather(a, b)))
+
+
+test_tf_gather()

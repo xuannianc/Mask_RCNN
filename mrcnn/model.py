@@ -1139,38 +1139,40 @@ def rpn_bbox_loss_graph(config, target_bbox, rpn_match, rpn_bbox):
     return loss
 
 
-def mrcnn_class_loss_graph(target_class_ids, pred_class_logits,
-                           active_class_ids):
+def mrcnn_class_loss_graph(target_class_ids, pred_class_logits, active_class_ids):
     """Loss for the classifier head of Mask RCNN.
 
-    target_class_ids: [batch, num_rois]. Integer class IDs. Uses zero
-        padding to fill in the array.
+    target_class_ids: [batch, num_rois]. Integer class IDs. Uses zero padding to fill in the array.
     pred_class_logits: [batch, num_rois, num_classes]
-    active_class_ids: [batch, num_classes]. Has a value of 1 for
-        classes that are in the dataset of the image, and 0
+    active_class_ids: [batch, num_classes]. Has a value of 1 for classes that are in the dataset of the image, and 0
         for classes that are not in the dataset.
     """
-    # During model building, Keras calls this function with
-    # target_class_ids of type float32. Unclear why. Cast it
-    # to int to get around it.
+    # During model building, Keras calls this function with target_class_ids of type float32. Unclear why.
+    # Cast it to int to get around it.
     target_class_ids = tf.cast(target_class_ids, 'int64')
 
-    # Find predictions of classes that are not in the dataset.
+    # pred_class_logits 第 2 维的最大值的 idx 作为预测的 idx
+    # shape 是 (batch_size, 200)
     pred_class_ids = tf.argmax(pred_class_logits, axis=2)
-    # TODO: Update this line to work with batch > 1. Right now it assumes all
-    #       images in a batch have the same active_class_ids
+    # Find predictions of classes that are not in the dataset.
+    # TODO: Update this line to work with batch > 1.
+    # Right now it assumes all images in a batch have the same active_class_ids
+    # active_class_idx[0] 表示第一个 batch_item 的 active_class_idx
+    # 注意: active_class_idx[0] 的 shape (num_classes,), 值为 0 表示 inactive, 值为 1 表示 active
+    # pred_class_ids ndims=2, 第二维度的值作为 active_class_idx[0] 的 idx
+    # pred_active 的 shape 为 (batch_size, num_rois=200) 第二维的值为 0 或 1 表示是否 active
     pred_active = tf.gather(active_class_ids[0], pred_class_ids)
 
     # Loss
-    loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
-        labels=target_class_ids, logits=pred_class_logits)
+    # target_class_ids 的 shape 为 (batch_size, num_rois)
+    # pred_class_logits 的 shape 为 (batch_size, num_rois, 2)
+    # FIXME: loss 的 shape 为 (batch_size, num_rois)?
+    loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=target_class_ids, logits=pred_class_logits)
 
-    # Erase losses of predictions of classes that are not in the active
-    # classes of the image.
+    # Erase losses of predictions of classes that are not in the active classes of the image.
     loss = loss * pred_active
 
-    # Computer loss mean. Use only predictions that contribute
-    # to the loss to get a correct mean.
+    # Computer loss mean. Use only predictions that contribute to the loss to get a correct mean.
     loss = tf.reduce_sum(loss) / tf.reduce_sum(pred_active)
     return loss
 
@@ -1178,30 +1180,36 @@ def mrcnn_class_loss_graph(target_class_ids, pred_class_logits,
 def mrcnn_bbox_loss_graph(target_bbox, target_class_ids, pred_bbox):
     """Loss for Mask R-CNN bounding box refinement.
 
-    target_bbox: [batch, num_rois, (dy, dx, log(dh), log(dw))]
-    target_class_ids: [batch, num_rois]. Integer class IDs.
-    pred_bbox: [batch, num_rois, num_classes, (dy, dx, log(dh), log(dw))]
+    target_bbox: [batch_size, num_rois, (dy, dx, log(dh), log(dw))]
+    target_class_ids: [batch_size, num_rois]. Integer class IDs.
+    pred_bbox: [batch_size, num_rois, num_classes, (dy, dx, log(dh), log(dw))]
     """
     # Reshape to merge batch and roi dimensions for simplicity.
+    # shape 为 (batch_size * num_rois,)
     target_class_ids = K.reshape(target_class_ids, (-1,))
+    # shape 为 (batch_size * num_rois, 4)
     target_bbox = K.reshape(target_bbox, (-1, 4))
+    # shape 为 (batch_size * num_rois, num_classes, 4)
     pred_bbox = K.reshape(pred_bbox, (-1, K.int_shape(pred_bbox)[2], 4))
 
-    # Only positive ROIs contribute to the loss. And only
-    # the right class_id of each ROI. Get their indices.
+    # Only positive ROIs contribute to the loss.
+    # And only the right class_id of each ROI. Get their indices.
+    # shape 为 (num_pos_rois,)
     positive_roi_ix = tf.where(target_class_ids > 0)[:, 0]
-    positive_roi_class_ids = tf.cast(
-        tf.gather(target_class_ids, positive_roi_ix), tf.int64)
+    # shape 为 (num_pos_rois,)
+    positive_roi_class_ids = tf.cast(tf.gather(target_class_ids, positive_roi_ix), tf.int64)
+    # shape 为 (num_pos_rois,2) 第二维的第一个元素表示 pos_roi_ix, 第二位的第二个元素表示 pos_roi 对应的 class_id
     indices = tf.stack([positive_roi_ix, positive_roi_class_ids], axis=1)
 
     # Gather the deltas (predicted and true) that contribute to loss
+    # shape 为 (num_pos_rois, 4)
     target_bbox = tf.gather(target_bbox, positive_roi_ix)
+    # tf.gather_nd 中 indices 的第一维的维度作为输出的第一维的维度, 第二维的值作为真正的下标从 target_bbox 中获取值
+    # shape 为 (num_pos_rois, 4)
     pred_bbox = tf.gather_nd(pred_bbox, indices)
 
     # Smooth-L1 Loss
-    loss = K.switch(tf.size(target_bbox) > 0,
-                    smooth_l1_loss(y_true=target_bbox, y_pred=pred_bbox),
-                    tf.constant(0.0))
+    loss = K.switch(tf.size(target_bbox) > 0, smooth_l1_loss(y_true=target_bbox, y_pred=pred_bbox), tf.constant(0.0))
     loss = K.mean(loss)
     return loss
 
@@ -1209,38 +1217,41 @@ def mrcnn_bbox_loss_graph(target_bbox, target_class_ids, pred_bbox):
 def mrcnn_mask_loss_graph(target_masks, target_class_ids, pred_masks):
     """Mask binary cross-entropy loss for the masks head.
 
-    target_masks: [batch, num_rois, height, width].
-        A float32 tensor of values 0 or 1. Uses zero padding to fill array.
-    target_class_ids: [batch, num_rois]. Integer class IDs. Zero padded.
-    pred_masks: [batch, proposals, height, width, num_classes] float32 tensor
-                with values from 0 to 1.
+    target_masks: (batch_size, num_rois, height, width).
+                  A float32 tensor of values 0 or 1. Uses zero padding to fill array.
+    target_class_ids: (batch_size, num_rois). Integer class IDs. Zero padded.
+    pred_masks: (batch_size, num_rois, height, width, num_classes) float32 tensor with values from 0 to 1.
     """
     # Reshape for simplicity. Merge first two dimensions into one.
+    # shape 为 (batch_size * num_rois,)
     target_class_ids = K.reshape(target_class_ids, (-1,))
     mask_shape = tf.shape(target_masks)
+    # shape 为 (batch_size * num_rois, mask_height, mask_width)
     target_masks = K.reshape(target_masks, (-1, mask_shape[2], mask_shape[3]))
     pred_shape = tf.shape(pred_masks)
-    pred_masks = K.reshape(pred_masks,
-                           (-1, pred_shape[2], pred_shape[3], pred_shape[4]))
-    # Permute predicted masks to [N, num_classes, height, width]
+    # shape 为 (batch_size * num_rois, mask_height, mask_width, num_classes)
+    pred_masks = K.reshape(pred_masks, (-1, pred_shape[2], pred_shape[3], pred_shape[4]))
+    # Permute predicted masks to (batch_size * num_rois, num_classes, mask_height, mask_width)
     pred_masks = tf.transpose(pred_masks, [0, 3, 1, 2])
 
-    # Only positive ROIs contribute to the loss. And only
-    # the class specific mask of each ROI.
-    positive_ix = tf.where(target_class_ids > 0)[:, 0]
-    positive_class_ids = tf.cast(
-        tf.gather(target_class_ids, positive_ix), tf.int64)
-    indices = tf.stack([positive_ix, positive_class_ids], axis=1)
+    # Only positive ROIs contribute to the loss.
+    # And only the class specific mask of each ROI.
+    # shape 为 (num_pos_rois,)
+    positive_roi_ix = tf.where(target_class_ids > 0)[:, 0]
+    # shape 为 (num_pos_rois,)
+    positive_roi_class_ids = tf.cast(tf.gather(target_class_ids, positive_roi_ix), tf.int64)
+    # shape 为 (num_pos_rois, 2)
+    indices = tf.stack([positive_roi_ix, positive_roi_class_ids], axis=1)
 
     # Gather the masks (predicted and true) that contribute to loss
-    y_true = tf.gather(target_masks, positive_ix)
+    # shape 为 (num_pos_rois, mask_height, mask_width)
+    y_true = tf.gather(target_masks, positive_roi_ix)
+    # shape 为 (num_pos_rois, mask_height, mask_width)
     y_pred = tf.gather_nd(pred_masks, indices)
 
     # Compute binary cross entropy. If no positive ROIs, then return 0.
     # shape: [batch, roi, num_classes]
-    loss = K.switch(tf.size(y_true) > 0,
-                    K.binary_crossentropy(target=y_true, output=y_pred),
-                    tf.constant(0.0))
+    loss = K.switch(tf.size(y_true) > 0, K.binary_crossentropy(target=y_true, output=y_pred), tf.constant(0.0))
     loss = K.mean(loss)
     return loss
 
