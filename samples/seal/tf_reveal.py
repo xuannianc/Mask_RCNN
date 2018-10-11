@@ -84,9 +84,15 @@ def test_tf_equal():
 def test_tf_nn_top():
     a = np.array([1, 7, 4, 5, 2, 6])
     b = tf.nn.top_k(a, k=a.shape[0])
+    c = np.array([[1, 7, 4, 5, 2, 6], [3, 9, 10, 8, 12, 11]])
+    d = tf.nn.top_k(c, k=3)
     with tf.Session() as sess:
+        # [1 5 3 2 4 0]
+        print(sess.run(b.indices))
         # [0 4 2 3 5 1]
         print(sess.run(b.indices[::-1]))
+        print(sess.run(d.indices))
+        print(sess.run(d.indices[::-1]))
 
 
 # test_tf_nn_top()
@@ -105,4 +111,11 @@ def test_tf_gather():
         print(sess.run(tf.gather(a, b)))
 
 
-test_tf_gather()
+# test_tf_gather()
+
+def test_tf_cast():
+    with tf.Session() as sess:
+        print(sess.run(tf.cast(tf.constant([]), tf.int64)))
+
+
+test_tf_cast()

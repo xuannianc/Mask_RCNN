@@ -22,6 +22,7 @@ import keras.backend as K
 import keras.layers as KL
 import keras.engine as KE
 import keras.models as KM
+import keras.utils as KU
 
 from mrcnn import utils
 
@@ -239,16 +240,16 @@ def apply_box_deltas_graph(boxes, deltas):
 def clip_boxes_graph(boxes, window):
     """
     此函数的作用我猜是对已经修改过的 bbox 进行再修正, 以确保坐标都在 normalized coordinate 里面
-    normalized coordinates 左下角的坐标为 (0,0), 右上角的坐标为 (1,1)
+    normalized coordinates 左上角的坐标为 (0,0), 右下角的坐标为 (1,1)
     boxes: [N, (y1, x1, y2, x2)]
     window: [4] in the form wy1, wx1, wy2, wx2
-                   __________(wy2,wx2)
+           (y1,x1) __________
                   |          |
-            ______|______    |
-           |      |clip |    |
-           |      |_____|____|
-           |            |
-    (y1,x1)|____________|
+                  |     _____|_____
+                  |     |clip|    |
+                  |_____|____|    |
+                        |         |
+                        |_________|(wy2,wx2)
     """
     # Split
     wy1, wx1, wy2, wx2 = tf.split(window, 4)
@@ -264,15 +265,15 @@ def clip_boxes_graph(boxes, window):
 
 
 class ProposalLayer(KE.Layer):
-    """Receives anchor scores and selects a subset to pass as proposals
-    to the second stage. Filtering is done based on anchor scores and
-    non-max suppression to remove overlaps. It also applies bounding
-    box refinement deltas to anchors.
+    """Receives anchor scores and selects a subset to pass as proposals to the second stage.
+    Filtering is done based on anchor scores and non-max suppression to remove overlaps.
+    It also applies bounding box refinement deltas to anchors.
 
     Inputs:
-        rpn_probs: [batch, num_anchors, (bg prob, fg prob)]
-        rpn_bbox: [batch, num_anchors, (dy, dx, log(dh), log(dw))]
-        anchors: [batch, num_anchors, (y1, x1, y2, x2)] anchors in normalized coordinates
+        rpn_probs: (batch_size, num_anchors, (bg prob, fg prob))
+                   前面是 bg prob , 后面是 fg prob 这很重要
+        rpn_bbox: (batch_size, num_anchors, (dy, dx, log(dh), log(dw)))
+        anchors: (batch_size, num_anchors, (y1, x1, y2, x2)] anchors in normalized coordinates
                  在 self.get_anchors() 调整成 normalized coordinates 坐标
 
     Returns:
@@ -282,37 +283,45 @@ class ProposalLayer(KE.Layer):
     def __init__(self, proposal_count, nms_threshold, config=None, **kwargs):
         super(ProposalLayer, self).__init__(**kwargs)
         self.config = config
-        # config.POST_NMS_ROIS_TRAINING 或 config.POST_NMS_ROIS_INFERENCE
+        # config.POST_NMS_ROIS_TRAINING=2000 或 config.POST_NMS_ROIS_INFERENCE=1000
         self.proposal_count = proposal_count
         self.nms_threshold = nms_threshold
 
     def call(self, inputs):
         # Box Scores. Use the foreground class confidence.
-        # scores 的 shape 是 [batch, num_anchors, 1]
+        # scores 的 shape 是 (batch_size, num_anchors)
         scores = inputs[0][:, :, 1]
         # Box Deltas
-        # deltas 的 shape 是 [batch, num_anchors, 4]
+        # deltas 的 shape 是 (batch, num_anchors, 4)
         deltas = inputs[1]
         deltas = deltas * np.reshape(self.config.RPN_BBOX_STD_DEV, [1, 1, 4])
         # Anchors
+        # anchors 的 shape 是 (batch, num_anchors, 4)
         anchors = inputs[2]
 
         # Improve performance by trimming to top anchors by score
         # and doing the rest on the smaller subset.
-        # 获取 config.PRE_NMS_LIMIT 和 tf.shape(anchors)[1](其实是 num_anchors) 的较小值
+        # 获取 config.PRE_NMS_LIMIT=6000 和 tf.shape(anchors)[1](其实是 num_anchors=261888) 的较小值
         pre_nms_limit = tf.minimum(self.config.PRE_NMS_LIMIT, tf.shape(anchors)[1])
         # 从 scores 中获取最大的 pre_nms_limit 个数的下标
+        # shape 为 (batch_size, config.PRE_NMS_LIMIT=6000)
+        # tf.nn.top_k 返回 https://www.tensorflow.org/api_docs/python/tf/nn/top_k
+        # scores 是二维的, 那么是对最后一维进行排序, 返回的 ix 维数也是 2, 参考 test_tf_nn_top
+        # ix 第二维的第一个数表示最大数的下标, 第二个数表示第二大的数的下标, 以此类推
         ix = tf.nn.top_k(scores, pre_nms_limit, sorted=True, name="top_anchors").indices
         # tf.gather 的第二个参数作为第一个参数的下标,获取该下标的元素
         # config.IMAGES_PER_GPU 作为 batch_size
+        # shape 为 (batch_size, config.PRE_NMS_LIMIT=6000)
         scores = utils.batch_slice([scores, ix], lambda x, y: tf.gather(x, y), self.config.IMAGES_PER_GPU)
+        # shape 为 (batch_size, config.PRE_NMS_LIMIT=6000, 4)
         deltas = utils.batch_slice([deltas, ix], lambda x, y: tf.gather(x, y), self.config.IMAGES_PER_GPU)
+        # shape 为 (batch_size, config.PRE_NMS_LIMIT=6000, 4)
         pre_nms_anchors = utils.batch_slice([anchors, ix], lambda a, x: tf.gather(a, x),
                                             self.config.IMAGES_PER_GPU,
                                             names=["pre_nms_anchors"])
 
         # Apply deltas to anchors to get refined anchors.
-        # [batch, config.PRE_NMS_LIMIT, (y1, x1, y2, x2)]
+        # (batch_size, config.PRE_NMS_LIMIT=6000, (y1, x1, y2, x2))
         boxes = utils.batch_slice([pre_nms_anchors, deltas],
                                   lambda x, y: apply_box_deltas_graph(x, y),
                                   self.config.IMAGES_PER_GPU,
@@ -364,19 +373,18 @@ class PyramidROIAlign(KE.Layer):
     """Implements ROI Pooling on multiple levels of the feature pyramid.
 
     Params:
-    - pool_shape: [pool_height, pool_width] of the output pooled regions. Usually [7, 7]
+    - pool_shape: (pool_size, pool_size) of the output pooled regions. Usually [7, 7]
 
     Inputs:
-    - boxes: [batch, num_boxes, (y1, x1, y2, x2)] in normalized coordinates.
+    - rois: (batch_size, num_rois, (y1, x1, y2, x2)) in normalized coordinates.
              Possibly padded with zeros if not enough boxes to fill the array.
-    - image_meta: [batch, (meta data)] Image details. See compose_image_meta()
+    - image_meta: (batch_size, (meta data)) Image details. See compose_image_meta()
     - feature_maps: List of feature maps from different levels of the pyramid.
-                    Each is [batch, height, width, channels]
+                    Each is (batch_size, height, width, channels)
 
     Output:
-    Pooled regions in the shape: [batch, num_boxes, pool_height, pool_width, channels].
-    The width and height are those specific in the pool_shape in the layer
-    constructor.
+    Pooled regions in the shape: (batch_size, num_rois, pool_size, pool_size, channels).
+    The width and height are those specific in the pool_shape in the layer constructor.
     """
 
     def __init__(self, pool_shape, **kwargs):
@@ -384,8 +392,8 @@ class PyramidROIAlign(KE.Layer):
         self.pool_shape = tuple(pool_shape)
 
     def call(self, inputs):
-        # Crop boxes [batch_size, num_boxes, (y1, x1, y2, x2)] in normalized coords
-        boxes = inputs[0]
+        # Crop boxes (batch_size, num_rois, (y1, x1, y2, x2)) in normalized coords
+        rois = inputs[0]
 
         # Image meta
         # Holds details about the image. See compose_image_meta()
@@ -393,13 +401,13 @@ class PyramidROIAlign(KE.Layer):
         image_meta = inputs[1]
 
         # Feature Maps. List of feature maps from different level of the feature pyramid.
-        # Each is [batch_size, height, width, channels]
+        # Each is (batch_size, height, width, channels=256)
         feature_maps = inputs[2:]
 
         # Assign each ROI to a level in the pyramid based on the ROI area.
         # tf.split 参考 https://www.tensorflow.org/api_docs/python/tf/split
-        # y1, x1, y2, x2 的 shape 为 (batch_size, num_boxes, 1)
-        y1, x1, y2, x2 = tf.split(boxes, 4, axis=2)
+        # y1, x1, y2, x2 的 shape 为 (batch_size, num_rois, 1)
+        y1, x1, y2, x2 = tf.split(rois, 4, axis=2)
         h = y2 - y1
         w = x2 - x1
         # Use shape of first image. Images in a batch must have the same size.
@@ -411,9 +419,9 @@ class PyramidROIAlign(KE.Layer):
         # 这里和论文中唯一的不同就是 224.0/tf.sqrt(image_area) 我想这是因为 rois 都被 normalized 了
         roi_level = log2_graph(tf.sqrt(h * w) / (224.0 / tf.sqrt(image_area)))
         # 这里的 4 是论文中的 k0
-        # roi_level 的 shape 为 (batch_size, num_boxes, 1)
+        # roi_level 的 shape 为 (batch_size, num_rois, 1)
         roi_level = tf.minimum(5, tf.maximum(2, 4 + tf.cast(tf.round(roi_level), tf.int32)))
-        # roi_level 的 shape 为 (batch_size, num_boxes)
+        # roi_level 的 shape 为 (batch_size, num_rois)
         roi_level = tf.squeeze(roi_level, 2)
 
         # Loop through levels and apply ROI pooling to each. P2 to P5.
@@ -421,23 +429,24 @@ class PyramidROIAlign(KE.Layer):
         box_to_level = []
         for i, level in enumerate(range(2, 6)):
             # ix 是一个二维数组
+            # 当 roi_level 是一个二维数组, ix 第二维的长度为 2
             ix = tf.where(tf.equal(roi_level, level))
             # tf.gather_nd 参考 https://www.tensorflow.org/api_docs/python/tf/manip/gather_nd
-            # 当 ix 是一个二维数组, 第二维的长度为 2. 第二维的第一个元素表示 batch_item id, 第二个参数表示 box_id, 组合起来就能获取 box
-            level_boxes = tf.gather_nd(boxes, ix)
+            # ix 第二维的第一个元素表示 batch_item id, 第二个元素表示 roi_id, 组合起来就能获取 roi
+            level_rois = tf.gather_nd(rois, ix)
 
-            # Box indices for crop_and_resize.
-            # box_indices 就是该 level 所有的 box 对应的 batch_item_id
-            # box_indices 的 shape 是 (num_level_bboxes,)
-            box_indices = tf.cast(ix[:, 0], tf.int32)
+            # ROI indices for crop_and_resize.
+            # roi_indices 就是该 level 所有的 roi 对应的 batch_item_id, 用于后面的 crop_and_resize
+            # roi_indices 的 shape 是 (num_level_rois,)
+            roi_indices = tf.cast(ix[:, 0], tf.int32)
 
             # Keep track of which box is mapped to which level
             box_to_level.append(ix)
 
             # Stop gradient propogation to ROI proposals
-            # 目前对 tf.stop_gradient 还不了解
-            level_boxes = tf.stop_gradient(level_boxes)
-            box_indices = tf.stop_gradient(box_indices)
+            # UNCLEAR: tf.stop_gradient 是做什么?
+            level_rois = tf.stop_gradient(level_rois)
+            roi_indices = tf.stop_gradient(roi_indices)
 
             # Crop and Resize
             # From Mask R-CNN paper: "We sample four regular locations,
@@ -447,9 +456,10 @@ class PyramidROIAlign(KE.Layer):
             # Here we use the simplified approach of a single value per bin,
             # which is how it's done in tf.crop_and_resize()
             # Result: [batch * num_boxes, pool_height, pool_width, channels]
-            # level_boxes 是 normalized 的, 而 feature_maps 是 pixel based 的, 这怎么能这样操作?
+            # NOTE: crop_and_resize 的第二个参数 boxes 就是要 normalized cordinates 下的值
+            # 参见 https://www.tensorflow.org/api_docs/python/tf/image/crop_and_resize
             pooled.append(
-                tf.image.crop_and_resize(feature_maps[i], level_boxes, box_indices, self.pool_shape, method="bilinear"))
+                tf.image.crop_and_resize(feature_maps[i], level_rois, roi_indices, self.pool_shape, method="bilinear"))
 
         # Pack pooled features into one tensor
         pooled = tf.concat(pooled, axis=0)
@@ -478,7 +488,7 @@ class PyramidROIAlign(KE.Layer):
         pooled = tf.gather(pooled, ix)
 
         # Re-add the batch dimension
-        shape = tf.concat([tf.shape(boxes)[:2], tf.shape(pooled)[1:]], axis=0)
+        shape = tf.concat([tf.shape(rois)[:2], tf.shape(pooled)[1:]], axis=0)
         pooled = tf.reshape(pooled, shape)
         return pooled
 
@@ -565,6 +575,7 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     asserts = [
         tf.Assert(tf.greater(tf.shape(proposals)[0], 0), [proposals], name="roi_assertion"),
     ]
+    # ???
     with tf.control_dependencies(asserts):
         proposals = tf.identity(proposals)
 
@@ -572,12 +583,12 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     proposals, _ = trim_zeros_graph(proposals, name="trim_proposals")
     gt_boxes, non_zeros = trim_zeros_graph(gt_boxes, name="trim_gt_boxes")
     gt_class_ids = tf.boolean_mask(gt_class_ids, non_zeros, name="trim_gt_class_ids")
-    # tf.where 返回 non_zeros 中 True 的下标
+    # tf.where 返回一个二维数组, 第一维维度表示 non_zeros 中 True 的个数, 第二维的每一个元素表示 non_zeros 中 True 的下标
     gt_masks = tf.gather(gt_masks, tf.where(non_zeros)[:, 0], axis=2, name="trim_gt_masks")
 
     # Handle COCO crowds
-    # A crowd box in COCO is a bounding box around several instances. Exclude
-    # them from training. A crowd box is given a negative class ID.
+    # A crowd box in COCO is a bounding box around several instances. Exclude them from training.
+    # A crowd box is given a negative class ID.
     crowd_ix = tf.where(gt_class_ids < 0)[:, 0]
     non_crowd_ix = tf.where(gt_class_ids > 0)[:, 0]
     crowd_boxes = tf.gather(gt_boxes, crowd_ix)
@@ -592,16 +603,16 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     # Compute overlaps with crowd boxes [proposals, crowd_boxes]
     crowd_overlaps = overlaps_graph(proposals, crowd_boxes)
     crowd_iou_max = tf.reduce_max(crowd_overlaps, axis=1)
-    # 表示非 crowd box?
+    # FIXME: 表示非 crowd box?
     no_crowd_bool = (crowd_iou_max < 0.001)
 
-    # Determine positive and negative ROIs
-    roi_iou_max = tf.reduce_max(overlaps, axis=1)
-    # 1. Positive ROIs are those with >= 0.5 IoU with a GT box
-    positive_roi_bool = (roi_iou_max >= 0.5)
-    positive_indices = tf.where(positive_roi_bool)[:, 0]
+    # Determine positive and negative proposals
+    proposals_iou_max = tf.reduce_max(overlaps, axis=1)
+    # 1. Positive proposals are those with >= 0.5 IoU with a GT box
+    positive_proposals_bool = (proposals_iou_max >= 0.5)
+    positive_indices = tf.where(positive_proposals_bool)[:, 0]
     # 2. Negative ROIs are those with < 0.5 with every GT box. Skip crowds.
-    negative_indices = tf.where(tf.logical_and(roi_iou_max < 0.5, no_crowd_bool))[:, 0]
+    negative_indices = tf.where(tf.logical_and(proposals_iou_max < 0.5, no_crowd_bool))[:, 0]
 
     # Subsample ROIs. Aim for 33% positive
     # Positive ROIs
@@ -615,11 +626,12 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     negative_count = tf.cast(r * tf.cast(positive_count, tf.float32), tf.int32) - positive_count
     negative_indices = tf.random_shuffle(negative_indices)[:negative_count]
     # Gather selected ROIs
-    positive_rois = tf.gather(proposals, positive_indices)
-    negative_rois = tf.gather(proposals, negative_indices)
+    positive_proposals = tf.gather(proposals, positive_indices)
+    negative_proposals = tf.gather(proposals, negative_indices)
 
     # Assign positive ROIs to GT boxes.
     positive_overlaps = tf.gather(overlaps, positive_indices)
+    # FIXME: roi_gt_box_assignment 里面的元素会重复,因为存在多个 proposals 和同一个 gt_bbox 有最大 iou 的可能
     roi_gt_box_assignment = tf.cond(
         tf.greater(tf.shape(positive_overlaps)[1], 0),
         true_fn=lambda: tf.argmax(positive_overlaps, axis=1),
@@ -629,23 +641,24 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     roi_gt_class_ids = tf.gather(gt_class_ids, roi_gt_box_assignment)
 
     # Compute bbox refinement for positive ROIs
-    deltas = utils.box_refinement_graph(positive_rois, roi_gt_boxes)
+    deltas = utils.box_refinement_graph(positive_proposals, roi_gt_boxes)
     deltas /= config.BBOX_STD_DEV
 
-    # Assign positive ROIs to GT masks
+    # Assign positive proposals to GT masks
     # Permute masks to [N, height, width, 1]
     # expand_dims 之后可以认为 transposed_masks 变成了 N 个 shape 为 (height,width,1) 的 image 组成的 batch
+    # N 为 gt_masks 经过 "去 padding", "去 crowd" 的数量
     transposed_masks = tf.expand_dims(tf.transpose(gt_masks, [2, 0, 1]), -1)
-    # Pick the right mask for each ROI
+    # Pick the right mask for each positive proposals
     # 相当于从 batch 中选择一部分的 image
     roi_masks = tf.gather(transposed_masks, roi_gt_box_assignment)
 
     # Compute mask targets
-    boxes = positive_rois
+    boxes = positive_proposals
     if config.USE_MINI_MASK:
         # Transform ROI coordinates from normalized image space
         # to normalized mini-mask space.
-        y1, x1, y2, x2 = tf.split(positive_rois, 4, axis=1)
+        y1, x1, y2, x2 = tf.split(positive_proposals, 4, axis=1)
         gt_y1, gt_x1, gt_y2, gt_x2 = tf.split(roi_gt_boxes, 4, axis=1)
         gt_h = gt_y2 - gt_y1
         gt_w = gt_x2 - gt_x1
@@ -659,14 +672,14 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     # https://www.tensorflow.org/api_docs/python/tf/image/crop_and_resize
     # 第一个参数 image, 表示一个 batch 的 image
     # 第二个参数 boxes, 表示 proposals 的坐标
-    # 第三个参数 box_ind, 表示 batch 中 image 的下标
+    # 第三个参数 box_ind, 表示 boxes 所在的 image 位于 batch 中的下标, 其长度和 boxes 一致
     # 第四个参数 crop_size, 表示 crop 和 resize 之后的大小
-    # masks 的 shape 为 (N, height, width, 1)
+    # masks 的 shape 为 (N, mask_height, mask_width, 1)
     masks = tf.image.crop_and_resize(tf.cast(roi_masks, tf.float32), boxes, box_ids, config.MASK_SHAPE)
     # Remove the extra dimension from masks.
     # tf.squeeze 参考 https://www.tensorflow.org/api_docs/python/tf/squeeze
     # 就是删除 dim_size=1 的 dim, 可以通过 axis 限制删除的 dim 的范围
-    # masks 的 shape 变为 (N, height, width)
+    # masks 的 shape 变为 (N, mask_height, mask_width)
     masks = tf.squeeze(masks, axis=3)
 
     # Threshold mask pixels at 0.5 to have GT masks be 0 or 1 to use with binary cross entropy loss.
@@ -676,8 +689,8 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
 
     # Append negative ROIs and pad bbox deltas and masks that
     # are not used for negative ROIs with zeros.
-    rois = tf.concat([positive_rois, negative_rois], axis=0)
-    N = tf.shape(negative_rois)[0]
+    rois = tf.concat([positive_proposals, negative_proposals], axis=0)
+    N = tf.shape(negative_proposals)[0]
     P = tf.maximum(config.TRAIN_ROIS_PER_IMAGE - tf.shape(rois)[0], 0)
     rois = tf.pad(rois, [(0, P), (0, 0)])
     roi_gt_boxes = tf.pad(roi_gt_boxes, [(0, N + P), (0, 0)])
@@ -704,8 +717,7 @@ class DetectionTargetLayer(KE.Layer):
 
     Returns: Target ROIs and corresponding class IDs, bounding box shifts,
     and masks.
-    rois: [batch, TRAIN_ROIS_PER_IMAGE, (y1, x1, y2, x2)] in normalized
-          coordinates
+    rois: [batch, TRAIN_ROIS_PER_IMAGE, (y1, x1, y2, x2)] in normalized coordinates
     target_class_ids: [batch, TRAIN_ROIS_PER_IMAGE]. Integer class IDs.
     target_deltas: [batch, TRAIN_ROIS_PER_IMAGE, (dy, dx, log(dh), log(dw)]
     target_mask: [batch, TRAIN_ROIS_PER_IMAGE, height, width]
@@ -906,19 +918,19 @@ def rpn_graph(feature_map, anchors_per_location, anchor_stride):
                    every pixel in the feature map), or 2 (every other pixel).
 
     Returns:
-        rpn_class_logits: [batch, H * W * anchors_per_location, 2] Anchor classifier logits (before softmax)
-        rpn_probs: [batch, H * W * anchors_per_location, 2] Anchor classifier probabilities.
-        rpn_bbox: [batch, H * W * anchors_per_location, (dy, dx, log(dh), log(dw))] Deltas to be applied to anchors.
+        rpn_class_logits: (batch_size, H * W * anchors_per_location, 2) Anchor classifier logits (before softmax)
+        rpn_probs: (batch_size, H * W * anchors_per_location, 2) Anchor classifier probabilities.
+        rpn_bbox: (batch_size, H * W * anchors_per_location, (dy, dx, log(dh), log(dw))) Deltas to be applied to anchors.
     """
     # TODO: check if stride of 2 causes alignment issues if the feature map is not even.
     # Shared convolutional base of the RPN
     shared = KL.Conv2D(512, (3, 3), padding='same', activation='relu', strides=anchor_stride,
                        name='rpn_conv_shared')(feature_map)
 
-    # Anchor Score. [batch, height, width, anchors_per_location * 2].
+    # Anchor Score. (batch_size, height, width, anchors_per_location * 2).
     x = KL.Conv2D(2 * anchors_per_location, (1, 1), padding='valid', activation='linear', name='rpn_class_raw')(shared)
 
-    # Reshape to [batch, num_anchors, 2]
+    # Reshape to (batch_size, num_anchors, 2)
     # height * width * anchors_per_location == num_anchors
     rpn_class_logits = KL.Lambda(lambda t: tf.reshape(t, [tf.shape(t)[0], -1, 2]))(x)
 
@@ -928,7 +940,7 @@ def rpn_graph(feature_map, anchors_per_location, anchor_stride):
 
     # Bounding box refinement. [batch, H, W, anchors_per_location * depth]
     # where depth is [x, y, log(w), log(h)]
-    x = KL.Conv2D(anchors_per_location * 4, (1, 1), padding="valid", activation='linear', name='rpn_bbox_pred')(shared)
+    x = KL.Conv2D(4 * anchors_per_location, (1, 1), padding="valid", activation='linear', name='rpn_bbox_pred')(shared)
 
     # Reshape to [batch, num_anchors, 4]
     rpn_bbox = KL.Lambda(lambda t: tf.reshape(t, [tf.shape(t)[0], -1, 4]))(x)
@@ -938,8 +950,7 @@ def rpn_graph(feature_map, anchors_per_location, anchor_stride):
 
 def build_rpn_model(anchor_stride, anchors_per_location, depth):
     """Builds a Keras model of the Region Proposal Network.
-    It wraps the RPN graph so it can be used multiple times with shared
-    weights.
+    It wraps the RPN graph so it can be used multiple times with shared weights.
 
     anchor_stride: Controls the density of anchors. Typically 1 (anchors for
                    every pixel in the feature map), or 2 (every other pixel).
@@ -966,22 +977,23 @@ def fpn_classifier_graph(rois, feature_maps, image_meta,
                          fc_layers_size=1024):
     """Builds the computation graph of the feature pyramid network classifier and regressor heads.
 
-    rois: [batch, num_rois, (y1, x1, y2, x2)] Proposal boxes in normalized coordinates.
+    rois: (batch_size, num_rois=200, (y1, x1, y2, x2)) Proposal boxes in normalized coordinates.
     feature_maps: List of feature maps from different layers of the pyramid,
                   [P2, P3, P4, P5]. Each has a different resolution.
-    image_meta: [batch, (meta data)] Image details. See compose_image_meta()
+    image_meta: (batch_size, (meta data)) Image details. See compose_image_meta()
     pool_size: The width of the square feature map generated from ROI Pooling.
     num_classes: number of classes, which determines the depth of the results
     train_bn: Boolean. Train or freeze Batch Norm layers
     fc_layers_size: Size of the 2 FC layers
 
     Returns:
-        logits: [batch, num_rois, NUM_CLASSES] classifier logits (before softmax)
-        probs: [batch, num_rois, NUM_CLASSES] classifier probabilities
-        bbox_deltas: [batch, num_rois, NUM_CLASSES, (dy, dx, log(dh), log(dw))] Deltas to apply to proposal boxes
+        logits: (batch_size, num_rois=200, NUM_CLASSES] classifier logits (before softmax)
+        probs: (batch_size, num_rois=200, NUM_CLASSES] classifier probabilities
+        bbox_deltas: (batch_size, num_rois=200, NUM_CLASSES, (dy, dx, log(dh), log(dw)))
+                     Deltas to apply to proposal boxes
     """
     # ROI Pooling
-    # Shape: [batch, num_rois, POOL_SIZE, POOL_SIZE, channels]
+    # Shape: (batch_size, num_rois=200, pool_size=7, pool_size=7, channels]
     x = PyramidROIAlign([pool_size, pool_size], name="roi_align_classifier")([rois, image_meta] + feature_maps)
     # Two 1024 FC layers (implemented with Conv2D for consistency)
     x = KL.TimeDistributed(KL.Conv2D(fc_layers_size, (pool_size, pool_size), padding="valid"),
@@ -2039,7 +2051,8 @@ class MaskRCNN():
 
         # Generate proposals
         proposal_count = config.POST_NMS_ROIS_TRAINING if mode == "training" else config.POST_NMS_ROIS_INFERENCE
-        # rpn_rois 的 shape [batch, self.proposal_count, (y1, x1, y2, x2)] in normalized coordinates and zero padded.
+        # rpn_rois 的 shape (batch_size, self.proposal_count=2000|1000, (y1, x1, y2, x2))
+        # in normalized coordinates and zero padded.
         rpn_rois = ProposalLayer(
             proposal_count=proposal_count,
             nms_threshold=config.RPN_NMS_THRESHOLD,
@@ -2105,6 +2118,8 @@ class MaskRCNN():
                        rpn_rois, output_rois,
                        rpn_class_loss, rpn_bbox_loss, class_loss, bbox_loss, mask_loss]
             model = KM.Model(inputs, outputs, name='mask_rcnn')
+            # model.summary()
+            KU.plot_model(model, to_file='logs/model.jpg', show_shapes=True)
         else:
             # Network Heads
             # Proposal classifier and BBox regressor heads
@@ -2246,9 +2261,7 @@ class MaskRCNN():
             layer = self.keras_model.get_layer(name)
             if layer.output in self.keras_model.losses:
                 continue
-            loss = (
-                    tf.reduce_mean(layer.output, keepdims=True)
-                    * self.config.LOSS_WEIGHTS.get(name, 1.))
+            loss = (tf.reduce_mean(layer.output, keepdims=True) * self.config.LOSS_WEIGHTS.get(name, 1.))
             self.keras_model.add_loss(loss)
 
         # Add L2 Regularization
@@ -2260,9 +2273,8 @@ class MaskRCNN():
         self.keras_model.add_loss(tf.add_n(reg_losses))
 
         # Compile
-        self.keras_model.compile(
-            optimizer=optimizer,
-            loss=[None] * len(self.keras_model.outputs))
+        # TODO[Adam]: 弄清楚为什么 loss 都是 None, 而不是之前计算出来的 loss
+        self.keras_model.compile(optimizer=optimizer, loss=[None] * len(self.keras_model.outputs))
 
         # Add metrics for losses
         for name in loss_names:
@@ -2270,14 +2282,11 @@ class MaskRCNN():
                 continue
             layer = self.keras_model.get_layer(name)
             self.keras_model.metrics_names.append(name)
-            loss = (
-                    tf.reduce_mean(layer.output, keepdims=True)
-                    * self.config.LOSS_WEIGHTS.get(name, 1.))
+            loss = (tf.reduce_mean(layer.output, keepdims=True) * self.config.LOSS_WEIGHTS.get(name, 1.))
             self.keras_model.metrics_tensors.append(loss)
 
     def set_trainable(self, layer_regex, keras_model=None, indent=0, verbose=1):
-        """Sets model layers as trainable if their names match
-        the given regular expression.
+        """Sets model layers as trainable if their names match the given regular expression.
         """
         # Print message on the first call (but not on recursive calls)
         if verbose > 0 and keras_model is None:
@@ -2287,15 +2296,13 @@ class MaskRCNN():
 
         # In multi-GPU training, we wrap the model. Get layers
         # of the inner model because they have the weights.
-        layers = keras_model.inner_model.layers if hasattr(keras_model, "inner_model") \
-            else keras_model.layers
+        layers = keras_model.inner_model.layers if hasattr(keras_model, "inner_model") else keras_model.layers
 
         for layer in layers:
             # Is the layer a model?
             if layer.__class__.__name__ == 'Model':
                 print("In model: ", layer.name)
-                self.set_trainable(
-                    layer_regex, keras_model=layer, indent=indent + 4)
+                self.set_trainable(layer_regex, keras_model=layer, indent=indent + 4)
                 continue
 
             if not layer.weights:
@@ -2309,8 +2316,7 @@ class MaskRCNN():
                 layer.trainable = trainable
             # Print trainable layer names
             if trainable and verbose > 0:
-                log("{}{:20}   ({})".format(" " * indent, layer.name,
-                                            layer.__class__.__name__))
+                log("{}{:20}   ({})".format(" " * indent, layer.name, layer.__class__.__name__))
 
     def set_log_dir(self, model_path=None):
         """Sets the model log directory and epoch counter.
@@ -2335,10 +2341,10 @@ class MaskRCNN():
             if m:
                 now = datetime.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
                                         int(m.group(4)), int(m.group(5)))
-                # Epoch number in file is 1-based, and in Keras code it's 0-based.
-                # -1 表示恢复成 keras 的 epoch id
+                # Epoch number in file is 1-based, and in keras code it's 0-based.
                 # So, adjust for that then increment by one to start from the next epoch
-                # +1 表示下一个 epoch id
+                # 文件名的中 epoch id 是从 1 开始的, 而 keras 代码中的 epoch id 则是从 0 开始的
+                # -1 表示获取 keras 的 epoch id, +1 表示下一个 epoch id
                 self.epoch = int(m.group(6)) - 1 + 1
                 print('Re-starting from epoch %d' % self.epoch)
 
@@ -2414,10 +2420,9 @@ class MaskRCNN():
 
         # Callbacks
         callbacks = [
-            keras.callbacks.TensorBoard(log_dir=self.log_dir,
-                                        histogram_freq=0, write_graph=True, write_images=False),
-            keras.callbacks.ModelCheckpoint(self.checkpoint_path,
-                                            verbose=0, save_weights_only=True),
+            # ???: 这几个参数的意思?
+            keras.callbacks.TensorBoard(log_dir=self.log_dir, histogram_freq=0, write_graph=True, write_images=False),
+            keras.callbacks.ModelCheckpoint(self.checkpoint_path, verbose=0, save_weights_only=True),
         ]
 
         # Add custom callbacks to the list
@@ -2450,6 +2455,7 @@ class MaskRCNN():
             workers=workers,
             use_multiprocessing=True,
         )
+        # ???: 这是干啥?
         self.epoch = max(self.epoch, epochs)
 
     def mold_inputs(self, images):
@@ -2917,8 +2923,9 @@ def norm_boxes_graph(boxes, shape):
     boxes: [..., (y1, x1, y2, x2)] in pixel coordinates
     shape: [..., (height, width)] in pixels
 
-    Note: In pixel coordinates (y2, x2) is outside the box. But in normalized
-    coordinates it's inside the box.
+    Note: In pixel coordinates (y2, x2) is outside the box.
+    But in normalized coordinates it's inside the box.
+    ??? 什么呀?
 
     Returns:
         [..., (y1, x1, y2, x2)] in normalized coordinates

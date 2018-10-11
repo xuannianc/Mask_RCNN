@@ -346,8 +346,8 @@ if __name__ == '__main__':
     # Load weights
     print("Loading weights ", weights_path)
     if args.weights.lower() == "coco":
-        # Exclude the last layers because they require a matching
-        # number of classes
+        # Exclude the last layers because they require a matching number of classes
+        # 这几层都和 num_classes 有关
         model.load_weights(weights_path, by_name=True, exclude=[
             "mrcnn_class_logits", "mrcnn_bbox_fc",
             "mrcnn_bbox", "mrcnn_mask"])

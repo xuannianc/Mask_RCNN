@@ -863,25 +863,29 @@ def batch_slice(inputs, graph_fn, batch_size, names=None):
     outputs = []
     for i in range(batch_size):
         # 取第 i 个 batch item 的数据
-        # 如 inputs 的两个元素原来的 shape 分别是 (1,261888,4) 和 (1,config.PRE_NMS_LIMIT)
-        # 会变成 (261888,4) 和 (config.PRE_NMS_LIMIT,)
+        # 如 inputs 的两个元素原来的 shape 分别是 (1,261888,4) 和 (1,config.PRE_NMS_LIMIT=6000)
+        # 会变成 (261888,4) 和 (config.PRE_NMS_LIMIT=6000,)
         inputs_slice = [x[i] for x in inputs]
         # 如 graph_fn 为 lambda x,y : tf.gather(x,y),就是 input_slice 第二个元素作为第一个元素的下标,获取相应的元素
-        # 如 output_slice 的 shape 会变成 (config.PRE_NMS_LIMIT, 4)
+        # 如 output_slice 的 shape 会变成 (config.PRE_NMS_LIMIT=6000, 4)
         output_slice = graph_fn(*inputs_slice)
         if not isinstance(output_slice, (tuple, list)):
             output_slice = [output_slice]
         outputs.append(output_slice)
     # Change outputs from a list of slices where each is a list of outputs
     # to a list of outputs and each has a list of slices
-    # 假设 batch_size > 1, outputs 原来为 [[output_slice_batch_item_1],[output_slice_batch_item_2],...,]
-    # 转换之后变为 [(output_slice_batch_item_1,output_slice_batch_item_2)]
-    # 但是为什么要这么转换?
+    # 假设 batch_size > 1, 且 graph_fn 输出是多个 tensor
+    # outputs 原来为 [[os_part1_bi_1,os_part2_bi_1,os_part3_bi_1],[os_part1_bi_2, os_part2_bi_2, os_part3_bi_2],...,]
+    # os 是 output_slice 的简写, bi 是 batch_item 的简写
+    # os_part1_bi_1 表示第一个 batch_item 的 output_slice 的第一个 tensor
+    # 转换之后变为 [(os_part1_bi_1,os_part1_bi_2,...),(os_part2_bi_1, os_part2_bi_2)...]
     outputs = list(zip(*outputs))
 
     if names is None:
         names = [None] * len(outputs)
-    # 按照上面的假设, tf.stack 的结果的 shape 是 (batch_size, config.PRE_NMS_LIMIT, 4)
+    # 按照上面的假设, tf.stack 的结果的 shape 是 (batch_size, config.PRE_NMS_LIMIT=6000, 4)
+    # 下式中的 o 其实是 (os_part1_bi_1,os_part2_bi_2,...)
+    # stack 会新建一个维度, 这是它和 concatenate 的区别
     result = [tf.stack(o, axis=0, name=n) for o, n in zip(outputs, names)]
     if len(result) == 1:
         result = result[0]
