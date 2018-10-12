@@ -118,4 +118,33 @@ def test_tf_cast():
         print(sess.run(tf.cast(tf.constant([]), tf.int64)))
 
 
-test_tf_cast()
+# test_tf_cast()
+
+def test_tf_sets_set_intersection():
+    a = np.array([1, 2, 3])
+    b = np.array([2, 4])
+    c = np.expand_dims(a, 0)
+    d = np.expand_dims(b, 0)
+
+    with tf.Session() as sess:
+        # 会报错, ValueError: Shape must be at least rank 2
+        # but is rank 1 for 'DenseToDenseSetOperation' (op: 'DenseToDenseSetOperation') with input shapes: [3], [2].
+        # print(sess.run(tf.sets.set_intersection(a, b)))
+        e = tf.sets.set_intersection(c, d)
+        f = tf.sparse_tensor_to_dense(e)
+        print(sess.run(e))
+        print(sess.run(f))
+
+
+# test_tf_sets_set_intersection()
+
+def test_tf_map_fn():
+    a = np.array([1, 2, 3, 4, 5])
+
+    def fn(num):
+        return np.ones(3) * num
+
+    with tf.Session() as sess:
+        print(sess.run(tf.map_fn(fn, a)))
+
+test_tf_map_fn()

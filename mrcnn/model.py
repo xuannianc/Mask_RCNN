@@ -371,6 +371,9 @@ def log2_graph(x):
 
 class PyramidROIAlign(KE.Layer):
     """Implements ROI Pooling on multiple levels of the feature pyramid.
+    FIXME: 主要是对 batch_size > 1 而引起的混乱进行重新排列
+    希望的结果是每个 batch_item 独立, 它的 rois 来自各个层的 feature_map
+    而事实上使用 crop_and_resize 进行 pooling 是获取的整个 batch 在同一个 feature_map 上的 roi
 
     Params:
     - pool_shape: (pool_size, pool_size) of the output pooled regions. Usually [7, 7]
@@ -426,22 +429,23 @@ class PyramidROIAlign(KE.Layer):
 
         # Loop through levels and apply ROI pooling to each. P2 to P5.
         pooled = []
-        box_to_level = []
+        roi_to_level = []
         for i, level in enumerate(range(2, 6)):
             # ix 是一个二维数组
-            # 当 roi_level 是一个二维数组, ix 第二维的长度为 2
+            # 当 roi_level 是一个二维数组, ix 第二维的长度为 2, shape 为 (num_level_rois_of_batch, 2)
             ix = tf.where(tf.equal(roi_level, level))
             # tf.gather_nd 参考 https://www.tensorflow.org/api_docs/python/tf/manip/gather_nd
             # ix 第二维的第一个元素表示 batch_item id, 第二个元素表示 roi_id, 组合起来就能获取 roi
+            # shape 为 (num_level_rois_of_batch, 4)
             level_rois = tf.gather_nd(rois, ix)
 
             # ROI indices for crop_and_resize.
             # roi_indices 就是该 level 所有的 roi 对应的 batch_item_id, 用于后面的 crop_and_resize
-            # roi_indices 的 shape 是 (num_level_rois,)
+            # roi_indices 的 shape 是 (num_level_rois_of_batch,)
             roi_indices = tf.cast(ix[:, 0], tf.int32)
 
             # Keep track of which box is mapped to which level
-            box_to_level.append(ix)
+            roi_to_level.append(ix)
 
             # Stop gradient propogation to ROI proposals
             # UNCLEAR: tf.stop_gradient 是做什么?
@@ -455,48 +459,52 @@ class PyramidROIAlign(KE.Layer):
             #
             # Here we use the simplified approach of a single value per bin,
             # which is how it's done in tf.crop_and_resize()
-            # Result: [batch * num_boxes, pool_height, pool_width, channels]
+            # FIXME: pooled 的 shape 为 (num_level_rois_of_batch, pool_height, pool_width, channels)?
             # NOTE: crop_and_resize 的第二个参数 boxes 就是要 normalized cordinates 下的值
             # 参见 https://www.tensorflow.org/api_docs/python/tf/image/crop_and_resize
             pooled.append(
                 tf.image.crop_and_resize(feature_maps[i], level_rois, roi_indices, self.pool_shape, method="bilinear"))
 
         # Pack pooled features into one tensor
+        # FIXME: pooled 的 shape 为 (batch_size * num_rois, pool_height, pool_width, channels)?
         pooled = tf.concat(pooled, axis=0)
 
         # Pack box_to_level mapping into one array and add another column representing the order of pooled boxes
-        # 各个 level 的 bbox 的下标
-        # shape 为 (num_boxes, 2)
-        box_to_level = tf.concat(box_to_level, axis=0)
+        # 各个 level 的 roi 的下标
+        # shape 为 (batch_size * num_rois, 2)
+        roi_to_level = tf.concat(roi_to_level, axis=0)
         # tf.range 参见 https://www.tensorflow.org/api_docs/python/tf/range
-        box_range = tf.expand_dims(tf.range(tf.shape(box_to_level)[0]), 1)
-        # shape 为 (num_boxes, 3) 第二维增加了一列表示 box 在 box_to_level 中的序号
-        box_to_level = tf.concat([tf.cast(box_to_level, tf.int32), box_range], axis=1)
+        # shape 为 (batch_size * num_rois, 1)
+        roi_range = tf.expand_dims(tf.range(tf.shape(roi_to_level)[0]), 1)
+        # shape 为 (batch_size * num_rois, 3) 第二维增加了一列表示 roi 在 roi_to_level 中的序号
+        roi_to_level = tf.concat([tf.cast(roi_to_level, tf.int32), roi_range], axis=1)
 
-        # Rearrange pooled features to match the order of the original boxes
-        # Sort box_to_level by batch then box index
+        # Rearrange pooled features to match the order of the original rois
+        # Sort roi_to_level by batch then roi index
         # TF doesn't have a way to sort by two columns, so merge them and sort.
-        sorting_tensor = box_to_level[:, 0] * 100000 + box_to_level[:, 1]
-        # ix 表示对 sorting_tensor 进行从小到大排序, 当前每个元素在排好序的列表中的 ix 组成的列表
-        # 假设 sorting_tensor 是 [1, 7, 4, 5, 2, 6], 那么 ix [0 4 2 3 5 1]
-        # 但是注意: box_to_level[:,[0,1]] 是 tf.where 返回的第二维数据,本身已经按照先 batch_item_id 后 box_id 排好序了
-        # 再排序似乎毫无意义, 返回的 ix 是 [0,1,...,num_boxes-1]
-        ix = tf.nn.top_k(sorting_tensor, k=tf.shape(box_to_level)[0]).indices[::-1]
-        # box_to_level[:, 2] 表示的是现在 box 的序号, 参数 ix 表示的对 sorting_tensor 排序的 ix
-        # 我觉得这一步是可以省略的
-        ix = tf.gather(box_to_level[:, 2], ix)
+        # batch_item_id * 10000 + roi_id(原来的 rois 中的序号)
+        sorting_tensor = roi_to_level[:, 0] * 100000 + roi_to_level[:, 1]
+        # ix 表示对 sorting_tensor 进行从小到大排序, 每个元素在原来序列中的序号组成的列表
+        # 假设 sorting_tensor 是 [1, 7, 4, 5, 2, 6], 排好序应该是 [1,2,4,5,6,7], 每个元素在原来序列中的序号分别是[0 4 2 3 5 1]
+        # 那么 ix=[0 4 2 3 5 1]
+        ix = tf.nn.top_k(sorting_tensor, k=tf.shape(roi_to_level)[0]).indices[::-1]
+        # roi_to_level[:, 2] 表示的是现在 roi 的序号, 参数 ix 表示的对 sorting_tensor 排序的 ix
+        # 假设参数 ix 的第 0 个数的值为 8, 那么表示该元素是 roi_to_level 第 8 个元素
+        # FIXME: 这一步是多余的?
+        ix = tf.gather(roi_to_level[:, 2], ix)
         pooled = tf.gather(pooled, ix)
 
         # Re-add the batch dimension
         shape = tf.concat([tf.shape(rois)[:2], tf.shape(pooled)[1:]], axis=0)
+        # shape 为 (batch_size, num_rois, pool_height, pool_width, channels)
         pooled = tf.reshape(pooled, shape)
         return pooled
 
     def compute_output_shape(self, input_shape):
         # input_shape 是所有 input 的 shape 组成的 list
-        # 所以 input_shape 第 0 个元素是 boxes 的 shape 为 (batch_size, num_boxes=200, 4)
+        # 所以 input_shape 第 0 个元素是 rois 的 shape 为 (batch_size, num_rois=200, 4)
         # input_shape 第 2 个元素是 feature_maps 的 shape[-1] 表示 channels
-        # 综上, 返回的 shape 是 [batch, num_boxes, pool_height, pool_width, channels]
+        # 综上, 返回的 shape 是 (batch_size, num_rois, pool_height, pool_width, channels]
         return input_shape[0][:2] + self.pool_shape + (input_shape[2][-1],)
 
 
@@ -553,19 +561,19 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
 
     Inputs:
 
-    proposals: [config.POST_NMS_ROIS_TRAINING, (y1, x1, y2, x2)] in normalized coordinates.
+    proposals: (config.POST_NMS_ROIS_TRAINING, (y1, x1, y2, x2)) in normalized coordinates.
                Might be zero padded if there are not enough proposals.
-    gt_class_ids: [config.MAX_GT_INSTANCES] int class IDs
-    gt_boxes: [config.MAX_GT_INSTANCES, (y1, x1, y2, x2)] in normalized coordinates.
-    gt_masks: [height, width, config.MAX_GT_INSTANCES] of boolean type.
+    gt_class_ids: (config.MAX_GT_INSTANCES] int class IDs
+    gt_boxes: (config.MAX_GT_INSTANCES, (y1, x1, y2, x2)) in normalized coordinates.
+    gt_masks: (height, width, config.MAX_GT_INSTANCES) of boolean type.
 
     Returns: Target ROIs and corresponding class IDs, bounding box shifts and masks.
 
-    rois: [config.TRAIN_ROIS_PER_IMAGE, (y1, x1, y2, x2)] in normalized coordinates
-    class_ids: [config.TRAIN_ROIS_PER_IMAGE]. Integer class IDs. Zero padded.
-    deltas: [config.TRAIN_ROIS_PER_IMAGE, (dy, dx, log(dh), log(dw))]
-    masks: [config.TRAIN_ROIS_PER_IMAGE, height, width]. Masks cropped to bbox
-           boundaries and resized to neural network output size.
+    rois: (config.TRAIN_ROIS_PER_IMAGE, (y1, x1, y2, x2)) in normalized coordinates
+    class_ids: (config.TRAIN_ROIS_PER_IMAGE). Integer class IDs. Zero padded.
+    deltas: (config.TRAIN_ROIS_PER_IMAGE, (dy, dx, log(dh), log(dw)))
+    masks: (config.TRAIN_ROIS_PER_IMAGE, height, width).
+           Masks cropped to bbox boundaries and resized to neural network output size.
 
     Note: Returned arrays might be zero padded if not enough target ROIs.
     """
@@ -631,7 +639,8 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
 
     # Assign positive ROIs to GT boxes.
     positive_overlaps = tf.gather(overlaps, positive_indices)
-    # FIXME: roi_gt_box_assignment 里面的元素会重复,因为存在多个 proposals 和同一个 gt_bbox 有最大 iou 的可能
+    # unclear: roi_gt_box_assignment 里面的元素是否会重复,是否存在多个 proposals 和同一个 gt_bbox 有最大 iou 的可能
+    # unclear: 因为前面已经有了 non-max_supression
     roi_gt_box_assignment = tf.cond(
         tf.greater(tf.shape(positive_overlaps)[1], 0),
         true_fn=lambda: tf.argmax(positive_overlaps, axis=1),
@@ -707,22 +716,20 @@ class DetectionTargetLayer(KE.Layer):
     and masks for each.
 
     Inputs:
-    proposals: [batch, N, (y1, x1, y2, x2)] in normalized coordinates. Might
-               be zero padded if there are not enough proposals.
-               N=self.proposals=config.POST_NMS_ROIS_TRAINING or config.POST_NMS_ROIS_INFERENCE
-    gt_class_ids: [batch, MAX_GT_INSTANCES] Integer class IDs.
-    gt_boxes: [batch, MAX_GT_INSTANCES, (y1, x1, y2, x2)] in normalized
-              coordinates.
-    gt_masks: [batch, height, width, MAX_GT_INSTANCES] of boolean type
+    proposals: (batch_size, N, (y1, x1, y2, x2)) in normalized coordinates.
+               Might be zero padded if there are not enough proposals.
+               N=proposal_count=config.POST_NMS_ROIS_TRAINING or config.POST_NMS_ROIS_INFERENCE
+    gt_class_ids: (batch_size, config.MAX_GT_INSTANCES) Integer class IDs.
+    gt_boxes: (batch_size, config.MAX_GT_INSTANCES, (y1, x1, y2, x2)) in normalized coordinates.
+    gt_masks: (batch_size, height, width, config.MAX_GT_INSTANCES) of boolean type
 
     Returns: Target ROIs and corresponding class IDs, bounding box shifts,
     and masks.
-    rois: [batch, TRAIN_ROIS_PER_IMAGE, (y1, x1, y2, x2)] in normalized coordinates
-    target_class_ids: [batch, TRAIN_ROIS_PER_IMAGE]. Integer class IDs.
-    target_deltas: [batch, TRAIN_ROIS_PER_IMAGE, (dy, dx, log(dh), log(dw)]
-    target_mask: [batch, TRAIN_ROIS_PER_IMAGE, height, width]
-                 Masks cropped to bbox boundaries and resized to neural
-                 network output size.
+    rois: (batch_size, TRAIN_ROIS_PER_IMAGE, (y1, x1, y2, x2)) in normalized coordinates
+    target_class_ids: (batch, TRAIN_ROIS_PER_IMAGE). Integer class IDs.
+    target_deltas: (batch, TRAIN_ROIS_PER_IMAGE, (dy, dx, log(dh), log(dw))
+    target_mask: (batch, TRAIN_ROIS_PER_IMAGE, height, width)
+                 Masks cropped to bbox boundaries and resized to neural network output size.
 
     Note: Returned arrays might be zero padded if not enough target ROIs.
     """
@@ -763,32 +770,34 @@ class DetectionTargetLayer(KE.Layer):
 #  Detection Layer
 ############################################################
 
-def refine_detections_graph(rois, probs, deltas, window, config):
-    """Refine classified proposals and filter overlaps and return final
-    detections.
+def refine_detections_graph(rois, mrcnn_class, mrcnn_deltas, window, config):
+    """Refine classified proposals and filter overlaps and return final detections.
 
-    Inputs:
-        rois: [N, (y1, x1, y2, x2)] in normalized coordinates
-        probs: [N, num_classes]. Class probabilities.
-        deltas: [N, num_classes, (dy, dx, log(dh), log(dw))]. Class-specific
-                bounding box deltas.
-        window: (y1, x1, y2, x2) in normalized coordinates. The part of the image
-            that contains the image excluding the padding.
+    Args:
+        rois: (num_rpn_rois, (y1, x1, y2, x2)) in normalized coordinates
+        mrcnn_class: (num_rpn_rois, num_classes). Class probabilities.
+        mrcnn_deltas: (num_rpn_rois, num_classes, (dy, dx, log(dh), log(dw))).
+                Class-specific bounding box deltas.
+        window: (y1, x1, y2, x2) in normalized coordinates.
+                The part of the image that contains the image excluding the padding.
 
-    Returns detections shaped: [num_detections, (y1, x1, y2, x2, class_id, score)] where
-        coordinates are normalized.
+    Returns:
+        detections: (num_detections, (y1, x1, y2, x2, class_id, score)) where
+                    coordinates are normalized.
     """
     # Class IDs per ROI
-    class_ids = tf.argmax(probs, axis=1, output_type=tf.int32)
+    # shape 为 (num_rpn_rois, )
+    class_ids = tf.argmax(mrcnn_class, axis=1, output_type=tf.int32)
     # Class probability of the top class of each ROI
-    indices = tf.stack([tf.range(probs.shape[0]), class_ids], axis=1)
-    class_scores = tf.gather_nd(probs, indices)
+    # shape 为 (num_rpn_rois, 2) 第二维的第一个元素是 rpn_roi_id, 第二个元素是 class_id
+    indices = tf.stack([tf.range(mrcnn_class.shape[0]), class_ids], axis=1)
+    # shape 为 (num_rpn_rois, )
+    class_scores = tf.gather_nd(mrcnn_class, indices)
     # Class-specific bounding box deltas
-    deltas_specific = tf.gather_nd(deltas, indices)
+    deltas_specific = tf.gather_nd(mrcnn_deltas, indices)
     # Apply bounding box deltas
-    # Shape: [boxes, (y1, x1, y2, x2)] in normalized coordinates
-    refined_rois = apply_box_deltas_graph(
-        rois, deltas_specific * config.BBOX_STD_DEV)
+    # Shape: (num_rpn_rois, (y1, x1, y2, x2)) in normalized coordinates
+    refined_rois = apply_box_deltas_graph(rois, deltas_specific * config.BBOX_STD_DEV)
     # Clip boxes to image window
     refined_rois = clip_boxes_graph(refined_rois, window)
 
@@ -799,6 +808,7 @@ def refine_detections_graph(rois, probs, deltas, window, config):
     # Filter out low confidence boxes
     if config.DETECTION_MIN_CONFIDENCE:
         conf_keep = tf.where(class_scores >= config.DETECTION_MIN_CONFIDENCE)[:, 0]
+        # 参见 test_tf_sets_set_intersection
         keep = tf.sets.set_intersection(tf.expand_dims(keep, 0),
                                         tf.expand_dims(conf_keep, 0))
         keep = tf.sparse_tensor_to_dense(keep)[0]
@@ -808,31 +818,36 @@ def refine_detections_graph(rois, probs, deltas, window, config):
     pre_nms_class_ids = tf.gather(class_ids, keep)
     pre_nms_scores = tf.gather(class_scores, keep)
     pre_nms_rois = tf.gather(refined_rois, keep)
+    # tf.unique 参考 https://www.tensorflow.org/api_docs/python/tf/unique
+    # 返回两个数组, 第一个数组为 unique 的值, 第二个数组为原来数组的数值在 unique 数组中的 idxs
     unique_pre_nms_class_ids = tf.unique(pre_nms_class_ids)[0]
 
     def nms_keep_map(class_id):
         """Apply Non-Maximum Suppression on ROIs of the given class."""
         # Indices of ROIs of the given class
-        ixs = tf.where(tf.equal(pre_nms_class_ids, class_id))[:, 0]
+        class_ixs = tf.where(tf.equal(pre_nms_class_ids, class_id))[:, 0]
         # Apply NMS
-        class_keep = tf.image.non_max_suppression(
-            tf.gather(pre_nms_rois, ixs),
-            tf.gather(pre_nms_scores, ixs),
+        class_keep_ixs = tf.image.non_max_suppression(
+            tf.gather(pre_nms_rois, class_ixs),
+            tf.gather(pre_nms_scores, class_ixs),
             max_output_size=config.DETECTION_MAX_INSTANCES,
             iou_threshold=config.DETECTION_NMS_THRESHOLD)
         # Map indices
-        class_keep = tf.gather(keep, tf.gather(ixs, class_keep))
+        class_keep_ixs = tf.gather(keep, tf.gather(class_ixs, class_keep_ixs))
         # Pad with -1 so returned tensors have the same shape
-        gap = config.DETECTION_MAX_INSTANCES - tf.shape(class_keep)[0]
-        class_keep = tf.pad(class_keep, [(0, gap)],
-                            mode='CONSTANT', constant_values=-1)
+        # NOTE: config.DETECTION_MAX_INSTANCES >= tf.shape(class_keep_ixs)[0]
+        gap = config.DETECTION_MAX_INSTANCES - tf.shape(class_keep_ixs)[0]
+        class_keep_ixs = tf.pad(class_keep_ixs, [(0, gap)], mode='CONSTANT', constant_values=-1)
         # Set shape so map_fn() can infer result shape
-        class_keep.set_shape([config.DETECTION_MAX_INSTANCES])
-        return class_keep
+        class_keep_ixs.set_shape([config.DETECTION_MAX_INSTANCES])
+        return class_keep_ixs
 
     # 2. Map over class IDs
-    nms_keep = tf.map_fn(nms_keep_map, unique_pre_nms_class_ids,
-                         dtype=tf.int64)
+    # tf.map_fn 参考 https://www.tensorflow.org/api_docs/python/tf/map_fn
+    # 就是把 unique_pre_nms_class_ids 的第 0 维的元素分别传递 nms_keep_map,进行调用
+    # 这里 nms_keep_map 返回的是一个 tensor, 那么 tf.map_fn 会把所有 tensor stack 起来
+    # shape 为 (num_unique_pre_nms_class_ids, config.DETECTION_MAX_INSTANCES)
+    nms_keep = tf.map_fn(nms_keep_map, unique_pre_nms_class_ids, dtype=tf.int64)
     # 3. Merge results into one list, and remove -1 padding
     nms_keep = tf.reshape(nms_keep, [-1])
     nms_keep = tf.gather(nms_keep, tf.where(nms_keep > -1)[:, 0])
@@ -845,9 +860,10 @@ def refine_detections_graph(rois, probs, deltas, window, config):
     class_scores_keep = tf.gather(class_scores, keep)
     num_keep = tf.minimum(tf.shape(class_scores_keep)[0], roi_count)
     top_ids = tf.nn.top_k(class_scores_keep, k=num_keep, sorted=True)[1]
+    # shape 为 (num_keep,)
     keep = tf.gather(keep, top_ids)
 
-    # Arrange output as [N, (y1, x1, y2, x2, class_id, score)]
+    # Arrange output as (num_keep, (y1, x1, y2, x2, class_id, score))
     # Coordinates are normalized.
     detections = tf.concat([
         tf.gather(refined_rois, keep),
@@ -877,7 +893,7 @@ class DetectionLayer(KE.Layer):
     def call(self, inputs):
         rois = inputs[0]
         mrcnn_class = inputs[1]
-        mrcnn_bbox = inputs[2]
+        mrcnn_deltas = inputs[2]
         image_meta = inputs[3]
 
         # Get windows of images in normalized coordinates. Windows are the area
@@ -885,23 +901,25 @@ class DetectionLayer(KE.Layer):
         # Use the shape of the first image in the batch to normalize the window
         # because we know that all images get resized to the same size.
         m = parse_image_meta_graph(image_meta)
+        # 0 表示第一个 batch_item
         image_shape = m['image_shape'][0]
         window = norm_boxes_graph(m['window'], image_shape[:2])
 
         # Run detection refinement graph on each item in the batch
         detections_batch = utils.batch_slice(
-            [rois, mrcnn_class, mrcnn_bbox, window],
+            [rois, mrcnn_class, mrcnn_deltas, window],
             lambda x, y, w, z: refine_detections_graph(x, y, w, z, self.config),
             self.config.IMAGES_PER_GPU)
 
         # Reshape output
-        # [batch, num_detections, (y1, x1, y2, x2, class_id, class_score)] in
+        # (batch_size, num_detections, (y1, x1, y2, x2, class_id, class_score)) in
         # normalized coordinates
         return tf.reshape(
             detections_batch,
             [self.config.BATCH_SIZE, self.config.DETECTION_MAX_INSTANCES, 6])
 
     def compute_output_shape(self, input_shape):
+        # None 表示 batch_size
         return (None, self.config.DETECTION_MAX_INSTANCES, 6)
 
 
@@ -987,13 +1005,13 @@ def fpn_classifier_graph(rois, feature_maps, image_meta,
     fc_layers_size: Size of the 2 FC layers
 
     Returns:
-        logits: (batch_size, num_rois=200, NUM_CLASSES] classifier logits (before softmax)
-        probs: (batch_size, num_rois=200, NUM_CLASSES] classifier probabilities
-        bbox_deltas: (batch_size, num_rois=200, NUM_CLASSES, (dy, dx, log(dh), log(dw)))
+        mrcnn_class_logits: (batch_size, num_rois=200, NUM_CLASSES) classifier logits (before softmax)
+        mrcnn_class: (batch_size, num_rois=200, NUM_CLASSES) classifier probabilities
+        mrcnn_deltas: (batch_size, num_rois=200, NUM_CLASSES, (dy, dx, log(dh), log(dw)))
                      Deltas to apply to proposal boxes
     """
     # ROI Pooling
-    # Shape: (batch_size, num_rois=200, pool_size=7, pool_size=7, channels]
+    # Shape: (batch_size, num_rois=200, pool_height=7, pool_width=7, channels=256]
     x = PyramidROIAlign([pool_size, pool_size], name="roi_align_classifier")([rois, image_meta] + feature_maps)
     # Two 1024 FC layers (implemented with Conv2D for consistency)
     x = KL.TimeDistributed(KL.Conv2D(fc_layers_size, (pool_size, pool_size), padding="valid"),
@@ -1008,38 +1026,38 @@ def fpn_classifier_graph(rois, feature_maps, image_meta,
     shared = KL.Lambda(lambda x: K.squeeze(K.squeeze(x, 3), 2), name="pool_squeeze")(x)
 
     # Classifier head
+    # shape 为 (batch_size, num_rois, NUM_CLASSES)
     mrcnn_class_logits = KL.TimeDistributed(KL.Dense(num_classes), name='mrcnn_class_logits')(shared)
-    mrcnn_probs = KL.TimeDistributed(KL.Activation("softmax"), name="mrcnn_class")(mrcnn_class_logits)
+    mrcnn_class = KL.TimeDistributed(KL.Activation("softmax"), name="mrcnn_class")(mrcnn_class_logits)
 
-    # BBox head
-    # [batch, num_rois, NUM_CLASSES * (dy, dx, log(dh), log(dw))]
+    # Delta head
+    # (batch_size, num_rois, NUM_CLASSES * (dy, dx, log(dh), log(dw)))
     x = KL.TimeDistributed(KL.Dense(num_classes * 4, activation='linear'), name='mrcnn_bbox_fc')(shared)
-    # Reshape to [batch, num_rois, NUM_CLASSES, (dy, dx, log(dh), log(dw))]
+    # Reshape to (batch_size, num_rois, NUM_CLASSES, (dy, dx, log(dh), log(dw)))
     s = K.int_shape(x)
     # 注意 Reshape 的参数是不包含 batch_size 的, 参见 https://keras.io/layers/core/#reshape
-    mrcnn_bbox = KL.Reshape((s[1], num_classes, 4), name="mrcnn_bbox")(x)
+    mrcnn_deltas = KL.Reshape((s[1], num_classes, 4), name="mrcnn_bbox")(x)
 
-    return mrcnn_class_logits, mrcnn_probs, mrcnn_bbox
+    return mrcnn_class_logits, mrcnn_class, mrcnn_deltas
 
 
-def build_fpn_mask_graph(rois, feature_maps, image_meta,
+def fpn_mask_graph(rois, feature_maps, image_meta,
                          pool_size, num_classes, train_bn=True):
     """Builds the computation graph of the mask head of Feature Pyramid Network.
 
-    rois: [batch, num_rois, (y1, x1, y2, x2)] Proposal boxes in normalized
-          coordinates.
-    feature_maps: List of feature maps from different layers of the pyramid,
-                  [P2, P3, P4, P5]. Each has a different resolution.
-    image_meta: [batch, (meta data)] Image details. See compose_image_meta()
+    rois: (batch_size, num_rois, (y1, x1, y2, x2)) Proposal boxes in normalized coordinates.
+    feature_maps: List of feature maps from different layers of the pyramid [P2, P3, P4, P5].
+                  Each has a different resolution.
+    image_meta: (batch_size, (meta data)) Image details. See compose_image_meta()
     pool_size: The width of the square feature map generated from ROI Pooling.
                config.MASK_POOL_SIZE
     num_classes: number of classes, which determines the depth of the results
     train_bn: Boolean. Train or freeze Batch Norm layers
 
-    Returns: Masks [batch, num_rois, MASK_POOL_SIZE, MASK_POOL_SIZE, NUM_CLASSES]
+    Returns: Masks (batch_size, num_rois, MASK_POOL_SIZE, MASK_POOL_SIZE, NUM_CLASSES)
     """
     # ROI Pooling
-    # Shape: [batch, num_rois, MASK_POOL_SIZE, MASK_POOL_SIZE, channels]
+    # Shape: (batch_size, num_rois, MASK_POOL_SIZE, MASK_POOL_SIZE, channels)
     x = PyramidROIAlign([pool_size, pool_size], name="roi_align_mask")([rois, image_meta] + feature_maps)
 
     # Conv layers
@@ -1098,111 +1116,122 @@ def rpn_class_loss_graph(rpn_match, rpn_class_logits):
     rpn_class_logits: (batch_size, num_anchors, 2). RPN classifier logits for FG/BG.
     """
     # Squeeze last dim to simplify
+    # shape 为 (batch_size, num_anchors)
     rpn_match = tf.squeeze(rpn_match, -1)
     # Get anchor classes. Convert the -1/+1 match to 0/1 values.
-    # 把 -1 转成 0
+    # 把 -1 转成 0, (K.equal 把 -1 转成了 False,K.cast 把 False 转成了 0)
+    # shape 为 (batch_size, num_anchors)
     anchor_class = K.cast(K.equal(rpn_match, 1), tf.int32)
     # Positive and Negative anchors contribute to the loss,
     # but neutral anchors (match value = 0) don't.
-    # 原来非 0 的 indices
-    indices = tf.where(K.not_equal(rpn_match, 0))
+    # rpn_match 中原来非 0 的元素 indices
+    # shape 为 (num_non_zeros, 2), 第二维的第一个下标表示 batch_item_id, 第二个下标表示 anchor_id
+    nonzero_indices = tf.where(K.not_equal(rpn_match, 0))
     # Pick rows that contribute to the loss and filter out the rest.
     # 获取原来值为 -1,1 部分的 rpn_class_logits
-    # shape 为 (num_pos_anchors + num_neg_anchors, 2)
-    rpn_class_logits = tf.gather_nd(rpn_class_logits, indices)
+    # shape 为 (num_nonzeros, 2)
+    rpn_class_logits = tf.gather_nd(rpn_class_logits, nonzero_indices)
     # 去除掉原来值为 0 的部分,由于前面的 K.cast, 原来的值 -1 变成了现在的 0, 原来的值 1 还是现在的 1
-    # shape 为(num_pos_anchors + num_neg_anchors,)
-    anchor_class = tf.gather_nd(anchor_class, indices)
+    # shape 为 (num_nonzeros,)
+    anchor_class = tf.gather_nd(anchor_class, nonzero_indices)
     # Cross entropy loss
     # sparse_categorical_crossentropy 参见 https://jovianlin.io/cat-crossentropy-vs-sparse-cat-crossentropy/
     # https://github.com/keras-team/keras/issues/7749
+    # FIXME: loss 的 shape 为 (num_nonzeros,)
     loss = K.sparse_categorical_crossentropy(target=anchor_class, output=rpn_class_logits, from_logits=True)
     loss = K.switch(tf.size(loss) > 0, K.mean(loss), tf.constant(0.0))
     return loss
 
 
-def rpn_bbox_loss_graph(config, target_bbox, rpn_match, rpn_bbox):
+def rpn_bbox_loss_graph(config, input_rpn_deltas, input_rpn_match, rpn_deltas):
     """Return the RPN bounding box loss graph.
 
     config: the model config object.
-    target_bbox: [batch, max positive anchors, (dy, dx, log(dh), log(dw))].
-        Uses 0 padding to fill in unsed bbox deltas.
-    rpn_match: [batch, anchors, 1]. Anchor match type. 1=positive,
-               -1=negative, 0=neutral anchor.
-    rpn_bbox: [batch, anchors, (dy, dx, log(dh), log(dw))]
+    input_rpn_deltas: (batch_size, num_train_anchors=256, (dy, dx, log(dh), log(dw))).
+                      Uses 0 padding to fill in unsed bbox deltas.
+    input_rpn_match: (batch_size, num_anchors, 1).
+                     Anchor match type. 1=positive, -1=negative, 0=neutral anchor.
+    rpn_deltas: (batch_size, num_anchors, (dy, dx, log(dh), log(dw))).
+                rpn_model 生成的
     """
-    # Positive anchors contribute to the loss, but negative and
-    # neutral anchors (match value of 0 or -1) don't.
-    rpn_match = K.squeeze(rpn_match, -1)
-    indices = tf.where(K.equal(rpn_match, 1))
+    # Positive anchors contribute to the loss,
+    # but negative and neutral anchors (match value of 0 or -1) don't.
+    # shape 为 (batch_size, num_anchors)
+    input_rpn_match = K.squeeze(input_rpn_match, -1)
+    # shape 为 (num_pos_rpn_anchors, 2), 第二维的第一个下标表示 batch_item_id, 第二个下标表示 anchor_id
+    positive_rpn_anchors_indices = tf.where(K.equal(input_rpn_match, 1))
 
     # Pick bbox deltas that contribute to the loss
-    rpn_bbox = tf.gather_nd(rpn_bbox, indices)
+    # shape 为 (num_pos_rpn_anchors, 4)
+    rpn_deltas = tf.gather_nd(rpn_deltas, positive_rpn_anchors_indices)
 
     # Trim target bounding box deltas to the same length as rpn_bbox.
-    # shape 为 (batch_size,) 表示每个 batch_item 的 positive anchors 的数量
-    batch_counts = K.sum(K.cast(K.equal(rpn_match, 1), tf.int32), axis=1)
-    # 此时 target_bbox 的 shape 就和 rpn_bbox 的 shape 相同了
-    target_bbox = batch_pack_graph(target_bbox, batch_counts, config.IMAGES_PER_GPU)
+    # shape 为 (batch_size,) 表示每个元素为 batch_item 的 positive rpn anchors 的数量
+    batch_counts = K.sum(K.cast(K.equal(input_rpn_match, 1), tf.int32), axis=1)
+    # batch_pack_graph 对 input_rpn_deltas 的每个 batch_item 的 256 个元素中
+    # 分别提取最前面的 batch_counts[batch_item_id] 个元素
+    # 此时 input_rpn_deltas 的 shape 就和 rpn_deltas 的 shape 相同了
+    # shape 为 (num_pos_rpn_anchors, 4)
+    input_rpn_deltas = batch_pack_graph(input_rpn_deltas, batch_counts, config.IMAGES_PER_GPU)
 
-    loss = smooth_l1_loss(target_bbox, rpn_bbox)
+    loss = smooth_l1_loss(input_rpn_deltas, rpn_deltas)
 
     loss = K.switch(tf.size(loss) > 0, K.mean(loss), tf.constant(0.0))
     return loss
 
 
-def mrcnn_class_loss_graph(target_class_ids, pred_class_logits, active_class_ids):
+def mrcnn_class_loss_graph(target_class_ids, mrcnn_class_logits, active_class_ids):
     """Loss for the classifier head of Mask RCNN.
 
-    target_class_ids: [batch, num_rois]. Integer class IDs. Uses zero padding to fill in the array.
-    pred_class_logits: [batch, num_rois, num_classes]
-    active_class_ids: [batch, num_classes]. Has a value of 1 for classes that are in the dataset of the image, and 0
-        for classes that are not in the dataset.
+    target_class_ids: (batch_size, num_rois). Integer class IDs. Uses zero padding to fill in the array.
+    mrcnn_class_logits: (batch_size, num_rois, num_classes)
+    active_class_ids: (batch_size, num_classes). Has a value of 1 for classes that are in the dataset of the image,
+                      and 0 for classes that are not in the dataset.
     """
     # During model building, Keras calls this function with target_class_ids of type float32. Unclear why.
     # Cast it to int to get around it.
     target_class_ids = tf.cast(target_class_ids, 'int64')
 
-    # pred_class_logits 第 2 维的最大值的 idx 作为预测的 idx
-    # shape 是 (batch_size, 200)
-    pred_class_ids = tf.argmax(pred_class_logits, axis=2)
+    # mrcnn_class_logits 第 2 维的最大值的 idx 作为预测的 idx
+    # shape 是 (batch_size, num_rois)
+    mrcnn_class_ids = tf.argmax(mrcnn_class_logits, axis=2)
     # Find predictions of classes that are not in the dataset.
     # TODO: Update this line to work with batch > 1.
     # Right now it assumes all images in a batch have the same active_class_ids
     # active_class_idx[0] 表示第一个 batch_item 的 active_class_idx
-    # 注意: active_class_idx[0] 的 shape (num_classes,), 值为 0 表示 inactive, 值为 1 表示 active
-    # pred_class_ids ndims=2, 第二维度的值作为 active_class_idx[0] 的 idx
-    # pred_active 的 shape 为 (batch_size, num_rois=200) 第二维的值为 0 或 1 表示是否 active
-    pred_active = tf.gather(active_class_ids[0], pred_class_ids)
+    # NOTE: active_class_idx[0] 的 shape (num_classes,), 值为 0 表示 inactive, 值为 1 表示 active
+    # mrcnn_class_ids 维度为 2, 第二维度的值作为 active_class_idx[0] 的 idx, 参见 test_tf_gather
+    # mrcnn_active 的 shape 为 (batch_size, num_rois=200) 第二维的值为 0 或 1 表示是否 active
+    mrcnn_active = tf.gather(active_class_ids[0], mrcnn_class_ids)
 
     # Loss
     # target_class_ids 的 shape 为 (batch_size, num_rois)
-    # pred_class_logits 的 shape 为 (batch_size, num_rois, 2)
+    # mcrnn_class_logits 的 shape 为 (batch_size, num_rois, 2)
     # FIXME: loss 的 shape 为 (batch_size, num_rois)?
-    loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=target_class_ids, logits=pred_class_logits)
+    loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=target_class_ids, logits=mrcnn_class_logits)
 
     # Erase losses of predictions of classes that are not in the active classes of the image.
-    loss = loss * pred_active
+    loss = loss * mrcnn_active
 
     # Computer loss mean. Use only predictions that contribute to the loss to get a correct mean.
-    loss = tf.reduce_sum(loss) / tf.reduce_sum(pred_active)
+    loss = tf.reduce_sum(loss) / tf.reduce_sum(mrcnn_active)
     return loss
 
 
-def mrcnn_bbox_loss_graph(target_bbox, target_class_ids, pred_bbox):
+def mrcnn_bbox_loss_graph(target_deltas, target_class_ids, mrcnn_deltas):
     """Loss for Mask R-CNN bounding box refinement.
 
-    target_bbox: [batch_size, num_rois, (dy, dx, log(dh), log(dw))]
-    target_class_ids: [batch_size, num_rois]. Integer class IDs.
-    pred_bbox: [batch_size, num_rois, num_classes, (dy, dx, log(dh), log(dw))]
+    target_deltas: (batch_size, num_rois, (dy, dx, log(dh), log(dw)))
+    target_class_ids: (batch_size, num_rois). Integer class IDs.
+    mrcnn_deltas: (batch_size, num_rois, num_classes, (dy, dx, log(dh), log(dw)))
     """
     # Reshape to merge batch and roi dimensions for simplicity.
     # shape 为 (batch_size * num_rois,)
     target_class_ids = K.reshape(target_class_ids, (-1,))
     # shape 为 (batch_size * num_rois, 4)
-    target_bbox = K.reshape(target_bbox, (-1, 4))
+    target_deltas = K.reshape(target_deltas, (-1, 4))
     # shape 为 (batch_size * num_rois, num_classes, 4)
-    pred_bbox = K.reshape(pred_bbox, (-1, K.int_shape(pred_bbox)[2], 4))
+    mrcnn_deltas = K.reshape(mrcnn_deltas, (-1, K.int_shape(mrcnn_deltas)[2], 4))
 
     # Only positive ROIs contribute to the loss.
     # And only the right class_id of each ROI. Get their indices.
@@ -1210,41 +1239,41 @@ def mrcnn_bbox_loss_graph(target_bbox, target_class_ids, pred_bbox):
     positive_roi_ix = tf.where(target_class_ids > 0)[:, 0]
     # shape 为 (num_pos_rois,)
     positive_roi_class_ids = tf.cast(tf.gather(target_class_ids, positive_roi_ix), tf.int64)
-    # shape 为 (num_pos_rois,2) 第二维的第一个元素表示 pos_roi_ix, 第二位的第二个元素表示 pos_roi 对应的 class_id
+    # shape 为 (num_pos_rois,2) 第二维的第一个元素表示 pos_roi_ix, 第二维的第二个元素表示 pos_roi 对应的 class_id
     indices = tf.stack([positive_roi_ix, positive_roi_class_ids], axis=1)
 
     # Gather the deltas (predicted and true) that contribute to loss
     # shape 为 (num_pos_rois, 4)
-    target_bbox = tf.gather(target_bbox, positive_roi_ix)
+    target_deltas = tf.gather(target_deltas, positive_roi_ix)
     # tf.gather_nd 中 indices 的第一维的维度作为输出的第一维的维度, 第二维的值作为真正的下标从 target_bbox 中获取值
     # shape 为 (num_pos_rois, 4)
-    pred_bbox = tf.gather_nd(pred_bbox, indices)
+    mrcnn_deltas = tf.gather_nd(mrcnn_deltas, indices)
 
     # Smooth-L1 Loss
-    loss = K.switch(tf.size(target_bbox) > 0, smooth_l1_loss(y_true=target_bbox, y_pred=pred_bbox), tf.constant(0.0))
+    loss = K.switch(tf.size(target_deltas) > 0, smooth_l1_loss(y_true=target_deltas, y_pred=mrcnn_deltas), tf.constant(0.0))
     loss = K.mean(loss)
     return loss
 
 
-def mrcnn_mask_loss_graph(target_masks, target_class_ids, pred_masks):
+def mrcnn_mask_loss_graph(target_masks, target_class_ids, mrcnn_masks):
     """Mask binary cross-entropy loss for the masks head.
 
-    target_masks: (batch_size, num_rois, height, width).
+    target_masks: (batch_size, num_rois, mask_height, mask_width).
                   A float32 tensor of values 0 or 1. Uses zero padding to fill array.
     target_class_ids: (batch_size, num_rois). Integer class IDs. Zero padded.
-    pred_masks: (batch_size, num_rois, height, width, num_classes) float32 tensor with values from 0 to 1.
+    mrcnn_masks: (batch_size, num_rois, mask_height, mask_width, num_classes) float32 tensor with values from 0 to 1.
     """
     # Reshape for simplicity. Merge first two dimensions into one.
     # shape 为 (batch_size * num_rois,)
     target_class_ids = K.reshape(target_class_ids, (-1,))
-    mask_shape = tf.shape(target_masks)
+    target_mask_shape = tf.shape(target_masks)
     # shape 为 (batch_size * num_rois, mask_height, mask_width)
-    target_masks = K.reshape(target_masks, (-1, mask_shape[2], mask_shape[3]))
-    pred_shape = tf.shape(pred_masks)
+    target_masks = K.reshape(target_masks, (-1, target_mask_shape[2], target_mask_shape[3]))
+    mrcnn_masks_shape = tf.shape(mrcnn_masks)
     # shape 为 (batch_size * num_rois, mask_height, mask_width, num_classes)
-    pred_masks = K.reshape(pred_masks, (-1, pred_shape[2], pred_shape[3], pred_shape[4]))
+    mrcnn_masks = K.reshape(mrcnn_masks, (-1, mrcnn_masks_shape[2], mrcnn_masks_shape[3], mrcnn_masks_shape[4]))
     # Permute predicted masks to (batch_size * num_rois, num_classes, mask_height, mask_width)
-    pred_masks = tf.transpose(pred_masks, [0, 3, 1, 2])
+    mrcnn_masks = tf.transpose(mrcnn_masks, [0, 3, 1, 2])
 
     # Only positive ROIs contribute to the loss.
     # And only the class specific mask of each ROI.
@@ -1252,17 +1281,18 @@ def mrcnn_mask_loss_graph(target_masks, target_class_ids, pred_masks):
     positive_roi_ix = tf.where(target_class_ids > 0)[:, 0]
     # shape 为 (num_pos_rois,)
     positive_roi_class_ids = tf.cast(tf.gather(target_class_ids, positive_roi_ix), tf.int64)
-    # shape 为 (num_pos_rois, 2)
+    # shape 为 (num_pos_rois, 2) 第二维的第一个元素表示 pos_roi_ix, 第二维的第二个元素表示 pos_roi 对应的 class_id
     indices = tf.stack([positive_roi_ix, positive_roi_class_ids], axis=1)
 
     # Gather the masks (predicted and true) that contribute to loss
     # shape 为 (num_pos_rois, mask_height, mask_width)
     y_true = tf.gather(target_masks, positive_roi_ix)
     # shape 为 (num_pos_rois, mask_height, mask_width)
-    y_pred = tf.gather_nd(pred_masks, indices)
+    y_pred = tf.gather_nd(mrcnn_masks, indices)
 
     # Compute binary cross entropy. If no positive ROIs, then return 0.
-    # shape: [batch, roi, num_classes]
+    # shape: (batch_size, num_rois, num_classes)
+    # UNCLEAR: 为什么是这个 shape?
     loss = K.switch(tf.size(y_true) > 0, K.binary_crossentropy(target=y_true, output=y_pred), tf.constant(0.0))
     loss = K.mean(loss)
     return loss
@@ -1822,8 +1852,8 @@ def data_generator(dataset, config, shuffle=True, augment=False, augmentation=No
             # rpn_match 的 shape 是 (num_anchors,), 每一个元素为 -1,0,1.其中 -1 表示 negative,0 表示 neutral,1 表示 positive
             # rpn_bbox 的 shape 是 (num_train_anchors,4)
             # 默认 num_train_anchors=config.RPN_TRAIN_ANCHORS_PER_IMAGE=256
-            # 前 num_positive_anchors 为 [delta_h,delta_w,log(gt_h/a_h),log(gt_w/a_w)]
-            # 后 num_train_anchors-num_positive_anchors 为 [0,0,0,0]
+            # 前 num_positive_anchors 个元素为 [delta_h,delta_w,log(gt_h/a_h),log(gt_w/a_w)]
+            # 后 num_train_anchors-num_positive_anchors 个元素为 [0,0,0,0]
             rpn_match, rpn_bbox = build_rpn_targets(image.shape, anchors, gt_class_ids, gt_boxes, config)
 
             # Mask R-CNN Targets
@@ -1962,7 +1992,7 @@ class MaskRCNN():
         if mode == "training":
             # RPN GT
             input_rpn_match = KL.Input(shape=[None, 1], name="input_rpn_match", dtype=tf.int32)
-            input_rpn_bbox = KL.Input(shape=[None, 4], name="input_rpn_bbox", dtype=tf.float32)
+            input_rpn_deltas = KL.Input(shape=[None, 4], name="input_rpn_bbox", dtype=tf.float32)
 
             # Detection GT (class IDs, bounding boxes, and masks)
             # 1. GT Class IDs (zero padded)
@@ -2041,13 +2071,14 @@ class MaskRCNN():
         # Convert from list of lists of level outputs to list of lists of outputs across levels.
         # e.g. [[a1, b1, c1], [a2, b2, c2]] => [[a1, a2], [b1, b2], [c1, c2]]
         # layer_outputs 的形式是 [[rpn_class_logits_p2,rpn_class_p2,rpn_bbox_p2],[xx_p3,yy_p3_zz_p3],...,[xx_p6...]]
+        # NOTE: rpn_bbox 换成 rpn_deltas 更合适
         output_names = ["rpn_class_logits", "rpn_class", "rpn_bbox"]
         # outputs 的形式是 [[rpn_class_logits_p2,xx_p3,xx_p4...],[rpn_class_p2,yy_p3,yy_p4...],[rpn_bbox_p2,...]]
         outputs = list(zip(*layer_outputs))
         # outputs 的形式是 [rpn_class_logits_all_layers, rpn_class_all_layers, rpn_bbox_all_layers]
         outputs = [KL.Concatenate(axis=1, name=n)(list(o)) for o, n in zip(outputs, output_names)]
 
-        rpn_class_logits, rpn_class, rpn_bbox = outputs
+        rpn_class_logits, rpn_class, rpn_deltas = outputs
 
         # Generate proposals
         proposal_count = config.POST_NMS_ROIS_TRAINING if mode == "training" else config.POST_NMS_ROIS_INFERENCE
@@ -2057,7 +2088,7 @@ class MaskRCNN():
             proposal_count=proposal_count,
             nms_threshold=config.RPN_NMS_THRESHOLD,
             name="ROI",
-            config=config)([rpn_class, rpn_bbox, anchors])
+            config=config)([rpn_class, rpn_deltas, anchors])
 
         if mode == "training":
             # Class ID mask to mark class IDs supported by the dataset the image came from.
@@ -2081,13 +2112,13 @@ class MaskRCNN():
 
             # Network Heads
             # TODO: verify that this handles zero padded ROIs
-            mrcnn_class_logits, mrcnn_class, mrcnn_bbox = \
+            mrcnn_class_logits, mrcnn_class, mrcnn_deltas = \
                 fpn_classifier_graph(rois, mrcnn_feature_maps, input_image_meta,
                                      config.POOL_SIZE, config.NUM_CLASSES,
                                      train_bn=config.TRAIN_BN,
                                      fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
 
-            mrcnn_mask = build_fpn_mask_graph(rois, mrcnn_feature_maps,
+            mrcnn_mask = fpn_mask_graph(rois, mrcnn_feature_maps,
                                               input_image_meta,
                                               config.MASK_POOL_SIZE,
                                               config.NUM_CLASSES,
@@ -2100,30 +2131,30 @@ class MaskRCNN():
             rpn_class_loss = KL.Lambda(lambda x: rpn_class_loss_graph(*x), name="rpn_class_loss")(
                 [input_rpn_match, rpn_class_logits])
             rpn_bbox_loss = KL.Lambda(lambda x: rpn_bbox_loss_graph(config, *x), name="rpn_bbox_loss")(
-                [input_rpn_bbox, input_rpn_match, rpn_bbox])
-            class_loss = KL.Lambda(lambda x: mrcnn_class_loss_graph(*x), name="mrcnn_class_loss")(
+                [input_rpn_deltas, input_rpn_match, rpn_deltas])
+            mrcnn_class_loss = KL.Lambda(lambda x: mrcnn_class_loss_graph(*x), name="mrcnn_class_loss")(
                 [target_class_ids, mrcnn_class_logits, active_class_ids])
-            bbox_loss = KL.Lambda(lambda x: mrcnn_bbox_loss_graph(*x), name="mrcnn_bbox_loss")(
-                [target_deltas, target_class_ids, mrcnn_bbox])
-            mask_loss = KL.Lambda(lambda x: mrcnn_mask_loss_graph(*x), name="mrcnn_mask_loss")(
+            mrcnn_bbox_loss = KL.Lambda(lambda x: mrcnn_bbox_loss_graph(*x), name="mrcnn_bbox_loss")(
+                [target_deltas, target_class_ids, mrcnn_deltas])
+            mrcnn_mask_loss = KL.Lambda(lambda x: mrcnn_mask_loss_graph(*x), name="mrcnn_mask_loss")(
                 [target_mask, target_class_ids, mrcnn_mask])
 
             # Model
             inputs = [input_image, input_image_meta,
-                      input_rpn_match, input_rpn_bbox, input_gt_class_ids, input_gt_boxes, input_gt_masks]
+                      input_rpn_match, input_rpn_deltas, input_gt_class_ids, input_gt_boxes, input_gt_masks]
             if not config.USE_RPN_ROIS:
                 inputs.append(input_rois)
-            outputs = [rpn_class_logits, rpn_class, rpn_bbox,
-                       mrcnn_class_logits, mrcnn_class, mrcnn_bbox, mrcnn_mask,
+            outputs = [rpn_class_logits, rpn_class, rpn_deltas,
+                       mrcnn_class_logits, mrcnn_class, mrcnn_deltas, mrcnn_mask,
                        rpn_rois, output_rois,
-                       rpn_class_loss, rpn_bbox_loss, class_loss, bbox_loss, mask_loss]
+                       rpn_class_loss, rpn_bbox_loss, mrcnn_class_loss, mrcnn_bbox_loss, mrcnn_mask_loss]
             model = KM.Model(inputs, outputs, name='mask_rcnn')
             # model.summary()
-            KU.plot_model(model, to_file='logs/model.jpg', show_shapes=True)
+            # KU.plot_model(model, to_file='logs/model.jpg', show_shapes=True)
         else:
             # Network Heads
             # Proposal classifier and BBox regressor heads
-            mrcnn_class_logits, mrcnn_class, mrcnn_bbox = \
+            mrcnn_class_logits, mrcnn_class, mrcnn_deltas = \
                 fpn_classifier_graph(rpn_rois, mrcnn_feature_maps, input_image_meta,
                                      config.POOL_SIZE, config.NUM_CLASSES,
                                      train_bn=config.TRAIN_BN,
@@ -2133,19 +2164,19 @@ class MaskRCNN():
             # output is [batch, num_detections, (y1, x1, y2, x2, class_id, score)] in
             # normalized coordinates
             detections = DetectionLayer(config, name="mrcnn_detection")(
-                [rpn_rois, mrcnn_class, mrcnn_bbox, input_image_meta])
+                [rpn_rois, mrcnn_class, mrcnn_deltas, input_image_meta])
 
             # Create masks for detections
             detection_boxes = KL.Lambda(lambda x: x[..., :4])(detections)
-            mrcnn_mask = build_fpn_mask_graph(detection_boxes, mrcnn_feature_maps,
+            mrcnn_mask = fpn_mask_graph(detection_boxes, mrcnn_feature_maps,
                                               input_image_meta,
                                               config.MASK_POOL_SIZE,
                                               config.NUM_CLASSES,
                                               train_bn=config.TRAIN_BN)
 
             model = KM.Model([input_image, input_image_meta, input_anchors],
-                             [detections, mrcnn_class, mrcnn_bbox,
-                              mrcnn_mask, rpn_rois, rpn_class, rpn_bbox],
+                             [detections, mrcnn_class, mrcnn_deltas,
+                              mrcnn_mask, rpn_rois, rpn_class, rpn_deltas],
                              name='mask_rcnn')
 
         # Add multi-GPU support.
@@ -2461,8 +2492,8 @@ class MaskRCNN():
     def mold_inputs(self, images):
         """Takes a list of images and modifies them to the format expected
         as an input to the neural network.
-        images: List of image matrices [height,width,depth]. Images can have
-            different sizes.
+
+        images: List of image matrices [(height,width,depth),...]. Images can have different sizes.
 
         Returns 3 Numpy matrices:
         molded_images: [N, h, w, 3]. Images resized and normalized.
@@ -2473,19 +2504,19 @@ class MaskRCNN():
         molded_images = []
         image_metas = []
         windows = []
-        for image in images:
+        for idx, image in enumerate(images):
             # Resize image
             # TODO: move resizing to mold_image()
-            molded_image, window, scale, padding, crop = utils.resize_image(
+            resized_image, window, scale, padding, crop = utils.resize_image(
                 image,
                 min_dim=self.config.IMAGE_MIN_DIM,
                 min_scale=self.config.IMAGE_MIN_SCALE,
                 max_dim=self.config.IMAGE_MAX_DIM,
                 mode=self.config.IMAGE_RESIZE_MODE)
-            molded_image = mold_image(molded_image, self.config)
+            molded_image = mold_image(resized_image, self.config)
             # Build image_meta
             image_meta = compose_image_meta(
-                0, image.shape, molded_image.shape, window, scale,
+                idx, image.shape, molded_image.shape, window, scale,
                 np.zeros([self.config.NUM_CLASSES], dtype=np.int32))
             # Append
             molded_images.append(molded_image)
@@ -2574,8 +2605,7 @@ class MaskRCNN():
         masks: [H, W, N] instance binary masks
         """
         assert self.mode == "inference", "Create model in inference mode."
-        assert len(
-            images) == self.config.BATCH_SIZE, "len(images) must be equal to BATCH_SIZE"
+        assert len(images) == self.config.BATCH_SIZE, "len(images) must be equal to BATCH_SIZE"
 
         if verbose:
             log("Processing {} images".format(len(images)))
@@ -2920,15 +2950,15 @@ def batch_pack_graph(x, counts, num_rows):
 
 def norm_boxes_graph(boxes, shape):
     """Converts boxes from pixel coordinates to normalized coordinates.
-    boxes: [..., (y1, x1, y2, x2)] in pixel coordinates
-    shape: [..., (height, width)] in pixels
+    boxes: (batch_size, (y1, x1, y2, x2)) in pixel coordinates
+    shape: ((height, width),) in pixels
 
     Note: In pixel coordinates (y2, x2) is outside the box.
+    UNCLEAR: 为什么不包含?
     But in normalized coordinates it's inside the box.
-    ??? 什么呀?
 
     Returns:
-        [..., (y1, x1, y2, x2)] in normalized coordinates
+           (batch_size, (y1, x1, y2, x2)) in normalized coordinates
     """
     h, w = tf.split(tf.cast(shape, tf.float32), 2)
     scale = tf.concat([h, w, h, w], axis=-1) - tf.constant(1.0)

@@ -405,41 +405,43 @@ class Dataset(object):
 def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square"):
     """Resizes an image keeping the aspect ratio unchanged.
 
-    min_dim: if provided, resizes the image such that it's smaller
-        dimension == min_dim
-    max_dim: if provided, ensures that the image longest side doesn't
-        exceed this value.
-    min_scale: if provided, ensure that the image is scaled up by at least
-        this percent even if min_dim doesn't require it.
-    mode: Resizing mode.
-        none: No resizing. Return the image unchanged.
-        square: Resize and pad with zeros to get a square image
-            of size [max_dim, max_dim].
-        pad64: Pads width and height with zeros to make them multiples of 64.
-               If min_dim or min_scale are provided, it scales the image up
-               before padding. max_dim is ignored in this mode.
-               The multiple of 64 is needed to ensure smooth scaling of feature
-               maps up and down the 6 levels of the FPN pyramid (2**6=64).
-        crop: Picks random crops from the image. First, scales the image based
-              on min_dim and min_scale, then picks a random crop of
-              size min_dim x min_dim. Can be used in training only.
-              max_dim is not used in this mode.
+    Args:
+        min_dim: if provided, resizes the image such that it's smaller dimension == min_dim
+        max_dim: if provided, ensures that the image longest side doesn't exceed this value.
+        min_scale: if provided, ensure that the image is scaled up by at least
+                   this percent even if min_dim doesn't require it.
+        mode: Resizing mode.
+            none: No resizing. Return the image unchanged.
+            square: Resize and pad with zeros to get a square image
+                    of size [max_dim, max_dim].
+            pad64: Pads width and height with zeros to make them multiples of 64.
+                   If min_dim or min_scale are provided, it scales the image up
+                   before padding. max_dim is ignored in this mode.
+                   The multiple of 64 is needed to ensure smooth scaling of feature
+                   maps up and down the 6 levels of the FPN pyramid (2**6=64).
+            crop: Picks random crops from the image. First, scales the image based
+                  on min_dim and min_scale, then picks a random crop of
+                  size min_dim x min_dim. Can be used in training only.
+                  max_dim is not used in this mode.
 
     Returns:
-    image: the resized image
-    window: (y1, x1, y2, x2). If max_dim is provided, padding might
-        be inserted in the returned image. If so, this window is the
-        coordinates of the image part of the full image (excluding
-        the padding). The x2, y2 pixels are not included.
-    scale: The scale factor used to resize the image
-    padding: Padding added to the image [(top, bottom), (left, right), (0, 0)]
+        image: the resized image
+        window: (y1, x1, y2, x2). If max_dim is provided, padding might
+                be inserted in the returned image. If so, this window is the
+                coordinates of the image part of the full image (excluding
+                the padding). The x2, y2 pixels are not included.
+                window 的意思其实就是原 image 在 resized_image 中的位置
+                UNCLEAR: 为什么不包含 x2,y2?
+        scale: The scale factor used to resize the image
+        padding: Padding added to the image [(top, bottom), (left, right), (0, 0)]
     """
     # Keep track of image dtype and return results in the same dtype
     image_dtype = image.dtype
-    # Default window (y1, x1, y2, x2) and default scale == 1.
+    # Default window (0, 0, h, w) and default scale == 1.
     h, w = image.shape[:2]
     window = (0, 0, h, w)
     scale = 1
+    # 三个维度的开始和结束处的 padding
     padding = [(0, 0), (0, 0), (0, 0)]
     crop = None
 
@@ -461,7 +463,7 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square
             scale = max_dim / image_max
 
     # Resize image using bilinear interpolation
-    # round 四舍五入,默认不保留小数位,直接转成 int
+    # NOTE: round 四舍六入, 等于 5 时取就近的偶数, 默认不保留小数位,直接转成 int
     if scale != 1:
         image = resize(image, (round(h * scale), round(w * scale)), preserve_range=True)
 
@@ -474,7 +476,7 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square
         left_pad = (max_dim - w) // 2
         right_pad = max_dim - w - left_pad
         padding = [(top_pad, bottom_pad), (left_pad, right_pad), (0, 0)]
-        # image 的 shape 经过 pad 后会变成 (max_dim,max_dim,3)
+        # image 的 shape 经过 pad 后会变成 (max_dim, max_dim, 3)
         image = np.pad(image, padding, mode='constant', constant_values=0)
         window = (top_pad, left_pad, h + top_pad, w + left_pad)
     elif mode == "pad64":
