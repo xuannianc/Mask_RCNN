@@ -269,7 +269,9 @@ class Dataset(object):
     def __init__(self, class_map=None):
         self._image_ids = []
         self.image_info = []
-        # Background is always the first class, source 表示的是数据集的名称,如 seal
+        # Background is always the first class
+        # FIXME: source 是对整个 dataset 作一个更细粒度的划分, 每个 source 下有一些不同的 class
+        # UNCLEAR: 为什么要做这样的划分?
         self.class_info = [{"source": "", "id": 0, "name": "BG"}]
         self.source_class_ids = {}
 
@@ -335,12 +337,13 @@ class Dataset(object):
         self.sources = list(set([i['source'] for i in self.class_info]))
         self.source_class_ids = {}
         # Loop over datasets
-        # source_class_ids 是 {'': [0], 'seal': [0, 1]}, 多个 class 可能对应同一个 source
+        # source_class_ids 是 {'': [0], 'seal': [0, 1]}, 每一个 source 中都有 id=0 表示的 BG
         for source in self.sources:
             self.source_class_ids[source] = []
             # Find classes that belong to this dataset
             for i, info in enumerate(self.class_info):
                 # Include BG class in all datasets
+                # 一个 source 相当于一个数据中, class_id=0 表示的 BG 放到每一个数据集中
                 if i == 0 or source == info['source']:
                     self.source_class_ids[source].append(i)
 
@@ -379,7 +382,7 @@ class Dataset(object):
             image = skimage.color.gray2rgb(image)
         # If has an alpha channel, remove it for consistency
         if image.shape[-1] == 4:
-            # 省略号非常有意思, 代表若干个 :
+            # NOTE: 省略号非常有意思, 代表若干个 :
             image = image[..., :3]
         return image
 
@@ -388,15 +391,18 @@ class Dataset(object):
 
         Different datasets use different ways to store masks. Override this
         method to load instance masks and return them in the form of am
-        array of binary masks of shape [height, width, instances].
+        array of binary masks of shape (height, width, num_instances).
 
+        Args:
+            image_id: index of image in dataset
         Returns:
-            masks: A bool array of shape [height, width, instance count] with
-                a binary mask per instance.
+            masks: A bool array of shape (height, width, num_instances) with
+                   a binary mask per instance.
             class_ids: a 1D array of class IDs of the instance masks.
         """
         # Override this function to load a mask from your dataset.
         # Otherwise, it returns an empty mask.
+        # empty 创建相应 shape 的数组, 数组内的值都是无意义的
         mask = np.empty([0, 0, 0])
         class_ids = np.empty([0], np.int32)
         return mask, class_ids
@@ -518,13 +524,14 @@ def resize_mask(mask, scale, padding, crop=None):
     Typically, you get the scale and padding from resize_image() to
     ensure both, the image and the mask, are resized consistently.
 
-    scale: mask scaling factor
-    padding: Padding to add to the mask in the form
-            [(top, bottom), (left, right), (0, 0)]
+    Args:
+        scale: mask scaling factor
+        padding: Padding to add to the mask in the form
+                [(top, bottom), (left, right), (0, 0)]
     """
     # Suppress warning from scipy 0.13.0, the output shape of zoom() is
     # calculated with round() instead of int()
-    # 使用 round() 正好和 resize_image 中计算 scale 时使用 round() 保持了一致
+    # 使用 round() 正好和 resize_image 中调用 resize 时 使用的 round() 保持了一致
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         mask = scipy.ndimage.zoom(mask, zoom=[scale, scale, 1], order=0)
