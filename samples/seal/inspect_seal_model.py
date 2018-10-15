@@ -83,26 +83,57 @@ weights_path = osp.join(MODEL_DIR, 'seals20181012T1645/mask_rcnn_seals_0030.h5')
 print("Loading weights ", weights_path)
 model.load_weights(weights_path, by_name=True)
 image_id = random.choice(dataset.image_ids)
-resized_image, image_meta, gt_class_id, gt_bbox, gt_mask = \
-    modellib.load_image_gt(dataset, config, image_id, use_mini_mask=False)
-image_info = dataset.image_info[image_id]
-# Note: image_info 的 id 是 image 的 filename
-print("Image ID: {}.{} ({}) {}".format(image_info["source"], image_info["id"], image_id,
-                                       dataset.image_reference(image_id)))
 
-# Run object detection
-# rois: [N, (y1, x1, y2, x2)] detection bounding boxes
-# class_ids: [N] int class IDs
-# scores: [N] float probability scores for the class IDs
-# masks: [H, W, N] instance binary masks
-results = model.detect([resized_image], verbose=1)
 
-# Display results
-ax = get_ax()
-r = results[0]
-visualize.display_instances(resized_image, r['rois'], r['masks'], r['class_ids'],
-                            dataset.class_names, r['scores'], ax=ax, title="Predictions")
-log("gt_class_id", gt_class_id)
-log("gt_bbox", gt_bbox)
-log("gt_mask", gt_mask)
-plt.show()
+def display_resized_image():
+    resized_image, image_meta, gt_class_id, gt_bbox, gt_mask = \
+        modellib.load_image_gt(dataset, config, image_id, use_mini_mask=False)
+    image_info = dataset.image_info[image_id]
+    # Note: image_info 的 id 是 image 的 filename
+    print("Image ID: {}.{} ({}) {}".format(image_info["source"], image_info["id"], image_id,
+                                           dataset.image_reference(image_id)))
+
+    # Run object detection
+    # rois: [N, (y1, x1, y2, x2)] detection bounding boxes
+    # class_ids: [N] int class IDs
+    # scores: [N] float probability scores for the class IDs
+    # masks: [H, W, N] instance binary masks
+    results = model.detect([resized_image], verbose=1)
+
+    # Display results
+    ax = get_ax()
+    r = results[0]
+    visualize.display_instances(resized_image, r['rois'], r['masks'], r['class_ids'],
+                                dataset.class_names, r['scores'], ax=ax, title="Predictions")
+    log("gt_class_id", gt_class_id)
+    log("gt_bbox", gt_bbox)
+    log("gt_mask", gt_mask)
+    plt.show()
+
+
+display_resized_image()
+
+
+def display_image(model, image_id):
+    image = dataset.load_image(image_id)
+    image_info = dataset.image_info[image_id]
+    # Note: image_info 的 id 是 image 的 filename
+    print("Image ID: {}.{} ({}) {}".format(image_info["source"], image_info["id"], image_id,
+                                           dataset.image_reference(image_id)))
+
+    # Run object detection
+    # rois: [N, (y1, x1, y2, x2)] detection bounding boxes
+    # class_ids: [N] int class IDs
+    # scores: [N] float probability scores for the class IDs
+    # masks: [H, W, N] instance binary masks
+    results = model.detect([image], verbose=1)
+
+    # Display results
+    ax = get_ax()
+    r = results[0]
+    visualize.display_instances(image, r['rois'], r['masks'], r['class_ids'],
+                                dataset.class_names, r['scores'], ax=ax, title="Predictions")
+    plt.show()
+
+
+# display_image()

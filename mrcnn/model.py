@@ -2503,10 +2503,10 @@ class MaskRCNN():
 
         Returns:
             3 Numpy matrices:
-            molded_images: [N, h, w, 3]. Images resized and normalized.
-            image_metas: [N, length of meta data]. Details about each image.
-            windows: [N, (y1, x1, y2, x2)]. The portion of the image that has the
-                     original image (padding excluded).
+            molded_images: (batch_size=num_images, h, w, 3). Images resized and normalized.
+            image_metas: (batch_size=num_images, length_of_meta_data=14). Details about each image.
+            windows: (batch_size=num_images, (y1, x1, y2, x2)).
+                     The portion of the image that has the original image (padding excluded).
         """
         molded_images = []
         image_metas = []
