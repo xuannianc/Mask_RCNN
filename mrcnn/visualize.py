@@ -43,7 +43,8 @@ def display_images(images, titles=None, cols=4, cmap=None, norm=None,
     interpolation: Optional. Image interpolation to use for display.
     """
     titles = titles if titles is not None else [""] * len(images)
-    rows = len(images) // cols + 1
+    rows = len(images) // cols if len(images) % cols == 0 else len(images) // cols + 1
+    # figsize 两个参数分别为 (width, height) 单位是 inch
     plt.figure(figsize=(14, 14 * rows // cols))
     i = 1
     for image, title in zip(images, titles):

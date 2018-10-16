@@ -273,11 +273,11 @@ class ProposalLayer(KE.Layer):
         rpn_probs: (batch_size, num_anchors, (bg prob, fg prob))
                    前面是 bg prob , 后面是 fg prob 这很重要
         rpn_bbox: (batch_size, num_anchors, (dy, dx, log(dh), log(dw)))
-        anchors: (batch_size, num_anchors, (y1, x1, y2, x2)] anchors in normalized coordinates
+        anchors: (batch_size, num_anchors, (y1, x1, y2, x2)) anchors in normalized coordinates
                  在 self.get_anchors() 调整成 normalized coordinates 坐标
 
     Returns:
-        Proposals in normalized coordinates [batch, rois, (y1, x1, y2, x2)]
+        Proposals in normalized coordinates (batch_size, rois, (y1, x1, y2, x2))
     """
 
     def __init__(self, proposal_count, nms_threshold, config=None, **kwargs):
@@ -322,18 +322,18 @@ class ProposalLayer(KE.Layer):
 
         # Apply deltas to anchors to get refined anchors.
         # (batch_size, config.PRE_NMS_LIMIT=6000, (y1, x1, y2, x2))
-        boxes = utils.batch_slice([pre_nms_anchors, deltas],
-                                  lambda x, y: apply_box_deltas_graph(x, y),
-                                  self.config.IMAGES_PER_GPU,
-                                  names=["refined_anchors"])
+        refined_anchors = utils.batch_slice([pre_nms_anchors, deltas],
+                                            lambda x, y: apply_box_deltas_graph(x, y),
+                                            self.config.IMAGES_PER_GPU,
+                                            names=["refined_anchors"])
 
         # Clip to image boundaries. Since we're in normalized coordinates,
-        # clip to 0..1 range. [batch, config.PRE_NMS_LIMIT, (y1, x1, y2, x2)]
+        # clip to 0..1 range. (batch_size, config.PRE_NMS_LIMIT, (y1, x1, y2, x2))
         window = np.array([0, 0, 1, 1], dtype=np.float32)
-        boxes = utils.batch_slice(boxes,
-                                  lambda x: clip_boxes_graph(x, window),
-                                  self.config.IMAGES_PER_GPU,
-                                  names=["refined_anchors_clipped"])
+        refined_clipped_anchors = utils.batch_slice(refined_anchors,
+                                                    lambda x: clip_boxes_graph(x, window),
+                                                    self.config.IMAGES_PER_GPU,
+                                                    names=["refined_anchors_clipped"])
 
         # Filter out small boxes
         # According to Xinlei Chen's paper, this reduces detection accuracy for small objects, so we're skipping it.
@@ -352,7 +352,7 @@ class ProposalLayer(KE.Layer):
             proposals = tf.pad(proposals, [(0, padding), (0, 0)])
             return proposals
 
-        proposals = utils.batch_slice([boxes, scores], nms, self.config.IMAGES_PER_GPU)
+        proposals = utils.batch_slice([refined_clipped_anchors, scores], nms, self.config.IMAGES_PER_GPU)
         return proposals
 
     def compute_output_shape(self, input_shape):
@@ -639,8 +639,8 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
 
     # Assign positive ROIs to GT boxes.
     positive_overlaps = tf.gather(overlaps, positive_indices)
-    # unclear: roi_gt_box_assignment 里面的元素是否会重复,是否存在多个 proposals 和同一个 gt_bbox 有最大 iou 的可能
     # unclear: 因为前面已经有了 non-max_supression
+    # unclear: roi_gt_box_assignment 里面的元素是否会重复,是否存在多个 proposals 和同一个 gt_bbox 有最大 iou 的可能
     roi_gt_box_assignment = tf.cond(
         tf.greater(tf.shape(positive_overlaps)[1], 0),
         true_fn=lambda: tf.argmax(positive_overlaps, axis=1),
@@ -770,14 +770,14 @@ class DetectionTargetLayer(KE.Layer):
 #  Detection Layer
 ############################################################
 
-def refine_detections_graph(rois, mrcnn_class, mrcnn_deltas, window, config):
+def refine_detections_graph(rpn_rois, mrcnn_class, mrcnn_deltas, window, config):
     """Refine classified proposals and filter overlaps and return final detections.
 
     Args:
-        rois: (num_rpn_rois, (y1, x1, y2, x2)) in normalized coordinates
+        rpn_rois: (num_rpn_rois, (y1, x1, y2, x2)) in normalized coordinates
         mrcnn_class: (num_rpn_rois, num_classes). Class probabilities.
         mrcnn_deltas: (num_rpn_rois, num_classes, (dy, dx, log(dh), log(dw))).
-                Class-specific bounding box deltas.
+                      Class-specific bounding box deltas.
         window: (y1, x1, y2, x2) in normalized coordinates.
                 The part of the image that contains the image excluding the padding.
 
@@ -791,13 +791,13 @@ def refine_detections_graph(rois, mrcnn_class, mrcnn_deltas, window, config):
     # Class probability of the top class of each ROI
     # shape 为 (num_rpn_rois, 2) 第二维的第一个元素是 rpn_roi_id, 第二个元素是 class_id
     indices = tf.stack([tf.range(mrcnn_class.shape[0]), class_ids], axis=1)
-    # shape 为 (num_rpn_rois, )
+    # shape 为 (num_rpn_rois, ) 每个 rois 最大的 class score
     class_scores = tf.gather_nd(mrcnn_class, indices)
     # Class-specific bounding box deltas
     deltas_specific = tf.gather_nd(mrcnn_deltas, indices)
     # Apply bounding box deltas
     # Shape: (num_rpn_rois, (y1, x1, y2, x2)) in normalized coordinates
-    refined_rois = apply_box_deltas_graph(rois, deltas_specific * config.BBOX_STD_DEV)
+    refined_rois = apply_box_deltas_graph(rpn_rois, deltas_specific * config.BBOX_STD_DEV)
     # Clip boxes to image window
     refined_rois = clip_boxes_graph(refined_rois, window)
 
@@ -847,6 +847,7 @@ def refine_detections_graph(rois, mrcnn_class, mrcnn_deltas, window, config):
     # 就是把 unique_pre_nms_class_ids 的第 0 维的元素分别传递 nms_keep_map,进行调用
     # 这里 nms_keep_map 返回的是一个 tensor, 那么 tf.map_fn 会把所有 tensor stack 起来
     # shape 为 (num_unique_pre_nms_class_ids, config.DETECTION_MAX_INSTANCES)
+    # 每个 unique class id 关联的 rois 的下标, 下标个数不足 config.DETECTION_MAX_INSTANCES, 用 -1 代替
     nms_keep = tf.map_fn(nms_keep_map, unique_pre_nms_class_ids, dtype=tf.int64)
     # 3. Merge results into one list, and remove -1 padding
     nms_keep = tf.reshape(nms_keep, [-1])
@@ -881,8 +882,15 @@ class DetectionLayer(KE.Layer):
     """Takes classified proposal boxes and their bounding box deltas and
     returns the final detection boxes.
 
+    Inputs:
+        rpn_rois: shape 为 (batch_size, num_rpn_rois=1000, (y1, x1, y2, x2), ProposalLayer 生成
+        mrcnn_class: shape 为 (batch_size, num_rpn_rois=1000, num_classes) fpn_classifier_graph 生成
+        mrcnn_deltas: shape 为 (batch_size, num_rpn_rois=1000, num_classes, (y1, x1, y2, x2))
+                      fpn_classifier_graph 生成
+        image_meta: shape 为 (batch_size, 12 + num_classes)
+
     Returns:
-    [batch, num_detections, (y1, x1, y2, x2, class_id, class_score)] where
+    (batch_size, num_detections, (y1, x1, y2, x2, class_id, class_score)] where
     coordinates are normalized.
     """
 
@@ -891,23 +899,24 @@ class DetectionLayer(KE.Layer):
         self.config = config
 
     def call(self, inputs):
-        rois = inputs[0]
+        rpn_rois = inputs[0]
         mrcnn_class = inputs[1]
         mrcnn_deltas = inputs[2]
         image_meta = inputs[3]
 
-        # Get windows of images in normalized coordinates. Windows are the area
-        # in the image that excludes the padding.
+        # Get windows of images in normalized coordinates.
+        # Windows are the area in the image that excludes the padding.
         # Use the shape of the first image in the batch to normalize the window
         # because we know that all images get resized to the same size.
         m = parse_image_meta_graph(image_meta)
         # 0 表示第一个 batch_item
         image_shape = m['image_shape'][0]
+        # normalized_window
         window = norm_boxes_graph(m['window'], image_shape[:2])
 
         # Run detection refinement graph on each item in the batch
         detections_batch = utils.batch_slice(
-            [rois, mrcnn_class, mrcnn_deltas, window],
+            [rpn_rois, mrcnn_class, mrcnn_deltas, window],
             lambda x, y, w, z: refine_detections_graph(x, y, w, z, self.config),
             self.config.IMAGES_PER_GPU)
 
@@ -995,7 +1004,7 @@ def fpn_classifier_graph(rois, feature_maps, image_meta,
                          fc_layers_size=1024):
     """Builds the computation graph of the feature pyramid network classifier and regressor heads.
 
-    rois: (batch_size, num_rois=200, (y1, x1, y2, x2)) Proposal boxes in normalized coordinates.
+    rois: (batch_size, num_rois=200|1000, (y1, x1, y2, x2)) Proposal boxes in normalized coordinates.
     feature_maps: List of feature maps from different layers of the pyramid,
                   [P2, P3, P4, P5]. Each has a different resolution.
     image_meta: (batch_size, (meta data)) Image details. See compose_image_meta()
@@ -1005,13 +1014,13 @@ def fpn_classifier_graph(rois, feature_maps, image_meta,
     fc_layers_size: Size of the 2 FC layers
 
     Returns:
-        mrcnn_class_logits: (batch_size, num_rois=200, NUM_CLASSES) classifier logits (before softmax)
-        mrcnn_class: (batch_size, num_rois=200, NUM_CLASSES) classifier probabilities
-        mrcnn_deltas: (batch_size, num_rois=200, NUM_CLASSES, (dy, dx, log(dh), log(dw)))
+        mrcnn_class_logits: (batch_size, num_rois=200|1000, NUM_CLASSES) classifier logits (before softmax)
+        mrcnn_class: (batch_size, num_rois=200|1000, NUM_CLASSES) classifier probabilities
+        mrcnn_deltas: (batch_size, num_rois=200|1000, NUM_CLASSES, (dy, dx, log(dh), log(dw)))
                      Deltas to apply to proposal boxes
     """
     # ROI Pooling
-    # Shape: (batch_size, num_rois=200, pool_height=7, pool_width=7, channels=256]
+    # Shape: (batch_size, num_rois=200|1000, pool_height=7, pool_width=7, channels=256]
     x = PyramidROIAlign([pool_size, pool_size], name="roi_align_classifier")([rois, image_meta] + feature_maps)
     # Two 1024 FC layers (implemented with Conv2D for consistency)
     x = KL.TimeDistributed(KL.Conv2D(fc_layers_size, (pool_size, pool_size), padding="valid"),
@@ -1042,7 +1051,7 @@ def fpn_classifier_graph(rois, feature_maps, image_meta,
 
 
 def fpn_mask_graph(rois, feature_maps, image_meta,
-                         pool_size, num_classes, train_bn=True):
+                   pool_size, num_classes, train_bn=True):
     """Builds the computation graph of the mask head of Feature Pyramid Network.
 
     rois: (batch_size, num_rois, (y1, x1, y2, x2)) Proposal boxes in normalized coordinates.
@@ -1250,7 +1259,8 @@ def mrcnn_bbox_loss_graph(target_deltas, target_class_ids, mrcnn_deltas):
     mrcnn_deltas = tf.gather_nd(mrcnn_deltas, indices)
 
     # Smooth-L1 Loss
-    loss = K.switch(tf.size(target_deltas) > 0, smooth_l1_loss(y_true=target_deltas, y_pred=mrcnn_deltas), tf.constant(0.0))
+    loss = K.switch(tf.size(target_deltas) > 0, smooth_l1_loss(y_true=target_deltas, y_pred=mrcnn_deltas),
+                    tf.constant(0.0))
     loss = K.mean(loss)
     return loss
 
@@ -1569,24 +1579,25 @@ def build_detection_targets(rpn_rois, gt_class_ids, gt_boxes, gt_masks, config):
     return rois, roi_gt_class_ids, bboxes, masks
 
 
-def build_rpn_targets(image_shape, anchors, gt_class_ids, gt_boxes, config):
+def build_rpn_targets(anchors, gt_class_ids, gt_bboxes, config):
     """Given the anchors and GT boxes, compute overlaps and identify positive
     anchors and deltas to refine them to match their corresponding GT boxes.
 
-    anchors: [num_anchors, (y1, x1, y2, x2)]
-    gt_class_ids: [num_instances] Integer class IDs.
-    gt_boxes: [num_instances, (y1, x1, y2, x2)]
+    Args:
+        anchors: (num_anchors=261888, (y1, x1, y2, x2))
+        gt_class_ids: (num_instances,) Integer class IDs.
+        gt_bboxes: (num_instances, (y1, x1, y2, x2))
 
     Returns:
-    rpn_match: [N] (int32) matches between anchors and GT boxes.
-               1 = positive anchor, -1 = negative anchor, 0 = neutral
-    rpn_bbox: [N, (dy, dx, log(dh), log(dw))] Anchor bbox deltas.
+        rpn_match: (num_anchors=261888, ) (int32) matches between anchors and GT boxes.
+                   1 = positive anchor, -1 = negative anchor, 0 = neutral
+        rpn_deltas: (num_train_anchors=256, (dy, dx, log(dh), log(dw))] Anchor bbox deltas.
     """
     # RPN Match: 1 = positive anchor, -1 = negative anchor, 0 = neutral
     rpn_match = np.zeros([anchors.shape[0]], dtype=np.int32)
     # RPN bounding boxes: [max anchors per image, (dy, dx, log(dh), log(dw))]
     # config.RPN_TRAIN_ANCHORS_PER_IMAGE 默认为 256
-    rpn_bbox = np.zeros((config.RPN_TRAIN_ANCHORS_PER_IMAGE, 4))
+    rpn_deltas = np.zeros((config.RPN_TRAIN_ANCHORS_PER_IMAGE, 4))
 
     # Handle COCO crowds
     # A crowd box in COCO is a bounding box around several instances. Exclude
@@ -1595,41 +1606,47 @@ def build_rpn_targets(image_shape, anchors, gt_class_ids, gt_boxes, config):
     if crowd_ix.shape[0] > 0:
         # Filter out crowds from ground truth class IDs and boxes
         non_crowd_ix = np.where(gt_class_ids > 0)[0]
-        crowd_boxes = gt_boxes[crowd_ix]
-        gt_boxes = gt_boxes[non_crowd_ix]
-        # Compute overlaps with crowd boxes [anchors, crowds]
-        crowd_overlaps = utils.compute_overlaps(anchors, crowd_boxes)
+        crowd_bboxes = gt_bboxes[crowd_ix]
+        gt_bboxes = gt_bboxes[non_crowd_ix]
+        # Compute overlaps with crowd boxes
+        # shape 为 (num_anchors, num_crowd_bboxes)
+        crowd_overlaps = utils.compute_overlaps(anchors, crowd_bboxes)
+        # np.amax 参考 https://docs.scipy.org/doc/numpy-1.15.0/reference/generated/numpy.amax.html
+        # 取某一维度的最大值, 如果没有指定 axis 获取整个数组的最大值
         crowd_iou_max = np.amax(crowd_overlaps, axis=1)
+        # iou 小于 0.001 认为 anchor 和 crowd_bboxes 相交
         no_crowd_bool = (crowd_iou_max < 0.001)
     else:
         # All anchors don't intersect a crowd
         no_crowd_bool = np.ones([anchors.shape[0]], dtype=bool)
 
-    # Compute overlaps, shape 是 [num_anchors, num_gt_boxes]
-    overlaps = utils.compute_overlaps(anchors, gt_boxes)
+    # Compute overlaps
+    # shape 为 (num_anchors, num_gt_bboxes)
+    overlaps = utils.compute_overlaps(anchors, gt_bboxes)
 
     # Match anchors to GT Boxes
     # If an anchor overlaps a GT box with IoU >= 0.7 then it's positive.
     # If an anchor overlaps a GT box with IoU < 0.3 then it's negative.
     # Neutral anchors are those that don't match the conditions above,
     # and they don't influence the loss function.
-    # However, don't keep any GT box unmatched (rare, but happens). Instead,
-    # match it to the closest anchor (even if its max IoU is < 0.3).
-    #
+    # However, don't keep any GT box unmatched (rare, but happens).
+    # Instead, match it to the closest anchor (even if its max IoU is < 0.3).
+    # UNCLEAR: 为什么非 positive 的 anchors 也要设置 deltas?
     # 1. Set negative anchors first. They get overwritten below if a GT box is
     # matched to them. Skip boxes in crowd areas.
-    # 计算每一个 anchor 和所有 gt_bboxes 的最大 iou, shape 是 (num_anchors,)
+    # 计算每一个 anchor 和其有最大 iou 的 gt_bboxes 的 idx, shape 是 (num_anchors,)
     anchor_iou_argmax = np.argmax(overlaps, axis=1)
-    # 注意: 如果 anchor_iou_argmax 是一个数, 那么 np.arange(overlaps.shape[0]) 是可以换成 :
+    # NOTE: 如果 anchor_iou_argmax 是一个数, 那么 np.arange(overlaps.shape[0]) 是可以换成 :
     # 但是这里 anchor_iou_argmax 是一个 shape 为 (num_anchors,) 的数组
     anchor_iou_max = overlaps[np.arange(overlaps.shape[0]), anchor_iou_argmax]
     # 如果某个 anchor 和所有 gt_bboxes 的最大 iou 小于 0.3,那么认为该 anchor 为 negative
     rpn_match[(anchor_iou_max < 0.3) & (no_crowd_bool)] = -1
     # 2. Set an anchor for each GT box (regardless of IoU value).
     # TODO: If multiple anchors have the same IoU match all of them
-    # 计算每一个 gt_bbox 和所有 anchors 的最大 iou, 且认为该 anchor 为 positive, 不管 iou 是否大于等于 0.7
+    # 计算每一个 gt_bbox 和其有最大 iou 的 anchor 的 idx
+    # 认为该 anchor 为 positive, 不管 iou 是否大于等于 0.7
+    # shape 为 (num_instances, )
     gt_iou_argmax = np.argmax(overlaps, axis=0)
-    # 对于某个 gt_bbox 和它有最大 iou 的 anchor 设置为 positive
     rpn_match[gt_iou_argmax] = 1
     # 3. Set anchors with high overlap as positive.
     # 如果某个 anchor 和所有 gt_bboxes 的最大 iou 大于 0.7,那么认为该 anchor 为 positive
@@ -1662,7 +1679,7 @@ def build_rpn_targets(image_shape, anchors, gt_class_ids, gt_boxes, config):
     # TODO: use box_refinement() rather than duplicating the code here
     for i, a in zip(positive_ids, anchors[positive_ids]):
         # Closest gt box (it might have IoU < 0.7)
-        gt = gt_boxes[anchor_iou_argmax[i]]
+        gt = gt_bboxes[anchor_iou_argmax[i]]
 
         # Convert coordinates to center plus width/height.
         # GT Box
@@ -1677,17 +1694,18 @@ def build_rpn_targets(image_shape, anchors, gt_class_ids, gt_boxes, config):
         a_center_x = a[1] + 0.5 * a_w
 
         # Compute the bbox refinement that the RPN should predict.
-        rpn_bbox[ix] = [
+        rpn_deltas[ix] = [
             (gt_center_y - a_center_y) / a_h,
             (gt_center_x - a_center_x) / a_w,
             np.log(gt_h / a_h),
             np.log(gt_w / a_w),
         ]
         # Normalize
-        rpn_bbox[ix] /= config.RPN_BBOX_STD_DEV
+        # UNCLEAR: config.RPN_BBOX_STD_DEV 是什么意思?
+        rpn_deltas[ix] /= config.RPN_BBOX_STD_DEV
         ix += 1
 
-    return rpn_match, rpn_bbox
+    return rpn_match, rpn_deltas
 
 
 def generate_random_rois(image_shape, count, gt_class_ids, gt_boxes):
@@ -1859,7 +1877,7 @@ def data_generator(dataset, config, shuffle=True, augment=False, augmentation=No
             # 默认 num_train_anchors=config.RPN_TRAIN_ANCHORS_PER_IMAGE=256
             # 前 num_positive_anchors 个元素为 [delta_h,delta_w,log(gt_h/a_h),log(gt_w/a_w)]
             # 后 num_train_anchors-num_positive_anchors 个元素为 [0,0,0,0]
-            rpn_match, rpn_bbox = build_rpn_targets(image.shape, anchors, gt_class_ids, gt_boxes, config)
+            rpn_match, rpn_bbox = build_rpn_targets(anchors, gt_class_ids, gt_boxes, config)
 
             # Mask R-CNN Targets
             if num_random_rois:
@@ -2124,10 +2142,10 @@ class MaskRCNN():
                                      fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
 
             mrcnn_mask = fpn_mask_graph(rois, mrcnn_feature_maps,
-                                              input_image_meta,
-                                              config.MASK_POOL_SIZE,
-                                              config.NUM_CLASSES,
-                                              train_bn=config.TRAIN_BN)
+                                        input_image_meta,
+                                        config.MASK_POOL_SIZE,
+                                        config.NUM_CLASSES,
+                                        train_bn=config.TRAIN_BN)
 
             # TODO: clean up (use tf.identify if necessary)
             output_rois = KL.Lambda(lambda x: x * 1, name="output_rois")(rois)
@@ -2166,18 +2184,18 @@ class MaskRCNN():
                                      fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
 
             # Detections
-            # output is [batch, num_detections, (y1, x1, y2, x2, class_id, score)] in
-            # normalized coordinates
+            # output is (batch_size, num_detections, (y1, x1, y2, x2, class_id, score))
+            # in normalized coordinates
             detections = DetectionLayer(config, name="mrcnn_detection")(
                 [rpn_rois, mrcnn_class, mrcnn_deltas, input_image_meta])
 
             # Create masks for detections
             detection_boxes = KL.Lambda(lambda x: x[..., :4])(detections)
             mrcnn_mask = fpn_mask_graph(detection_boxes, mrcnn_feature_maps,
-                                              input_image_meta,
-                                              config.MASK_POOL_SIZE,
-                                              config.NUM_CLASSES,
-                                              train_bn=config.TRAIN_BN)
+                                        input_image_meta,
+                                        config.MASK_POOL_SIZE,
+                                        config.NUM_CLASSES,
+                                        train_bn=config.TRAIN_BN)
 
             model = KM.Model([input_image, input_image_meta, input_anchors],
                              [detections, mrcnn_class, mrcnn_deltas,
@@ -2795,17 +2813,17 @@ class MaskRCNN():
         return layers
 
     def run_graph(self, images, outputs, image_metas=None):
-        """Runs a sub-set of the computation graph that computes the given
-        outputs.
+        """Runs a sub-set of the computation graph that computes the given outputs.
 
-        image_metas: If provided, the images are assumed to be already
-            molded (i.e. resized, padded, and normalized)
+        Args:
+            image_metas: If provided, the images are assumed to be already
+                         molded (i.e. resized, padded, and normalized)
 
-        outputs: List of tuples (name, tensor) to compute. The tensors are
-            symbolic TensorFlow tensors and the names are for easy tracking.
+            outputs: List of tuples (name, tensor) to compute. The tensors are
+                     symbolic TensorFlow tensors and the names are for easy tracking.
 
-        Returns an ordered dict of results. Keys are the names received in the
-        input and values are Numpy arrays.
+        Returns: an ordered dict of results.
+                 Keys are the names received in the input and values are Numpy arrays.
         """
         model = self.keras_model
 
@@ -2903,7 +2921,7 @@ def parse_image_meta_graph(meta):
     """Parses a tensor that contains image attributes to its components.
     See compose_image_meta() for more details.
 
-    meta: [batch, meta length] where meta length depends on NUM_CLASSES
+    meta: (batch_size, meta_length=12 + num_classes) where meta length depends on NUM_CLASSES
 
     Returns a dict of the parsed tensors.
     """

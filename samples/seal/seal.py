@@ -205,17 +205,20 @@ def train(model):
 def color_splash(image, mask):
     """Apply color splash effect.
     Args:
-        image: RGB image [height, width, 3]
-        mask: instance segmentation mask [height, width, instance count]
+        image: RGB image (height, width, 3)
+        mask: instance segmentation mask (height, width, num_instances)
 
     Returns:
         result image.
     """
-    # Make a grayscale copy of the image. The grayscale copy still
-    # has 3 RGB channels, though.
+    # Make a grayscale copy of the image.
+    # The grayscale copy still has 3 RGB channels, though.
     # gray2rgb 返回的值都是 [0,1] 的值,所以后面要乘以 255
     gray = skimage.color.gray2rgb(skimage.color.rgb2gray(image))
     gray = gray * 255
+    # gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # gray = gray.reshape(gray.shape[:2] + (1, ))
+    # gray = np.broadcast_to(gray, image.shape)
     # Copy color pixels from the original color image where mask is set
     if mask.shape[-1] > 0:
         # We're treating all instances as one, so collapse the mask into one layer
