@@ -36,7 +36,8 @@ import skimage.draw
 import cv2
 
 # Root directory of the project
-ROOT_DIR = os.path.abspath("../../")
+# ROOT_DIR = os.path.abspath("../../")
+ROOT_DIR = '/home/adam/workspace/github/Mask_RCNN'
 SEAL_DIR = os.path.join(ROOT_DIR, 'samples', 'seal')
 # Import Mask RCNN
 sys.path.append(ROOT_DIR)  # To find local version of the library
@@ -337,6 +338,20 @@ def remove(model, image_path=None, video_path=None):
         vwriter.release()
 
 
+def remove2(model, image):
+    # Run model detection and generate the color splash effect
+    # Detect objects
+    r = model.detect([image], verbose=1)[0]
+    masks = r['masks']
+    if masks.shape[-1] > 0:
+        # We're treating all instances as one, so collapse the mask into one layer
+        masks = (np.sum(masks, -1, keepdims=True) >= 1)
+        _, _, r = cv2.split(image)
+        seal_removed_image = cv2.threshold(r, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+        seal_removed_image = cv2.cvtColor(seal_removed_image, cv2.COLOR_GRAY2BGR)
+        image = np.where(masks, seal_removed_image, image).astype(np.uint8)
+    return image
+
 ############################################################
 #  Training
 ############################################################
@@ -431,5 +446,8 @@ if __name__ == '__main__':
         detect_and_color_splash(model, image_path=args.image, video_path=args.video)
     elif args.command == 'remove':
         remove(model, image_path=args.image, video_path=args.video)
+    elif args.command == 'remove2':
+        image = cv2.imread(args.image)
+        remove2(model, image)
     else:
         print("'{}' is not recognized.Use 'train' or 'splash'".format(args.command))

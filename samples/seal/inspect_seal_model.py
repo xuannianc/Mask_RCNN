@@ -10,9 +10,11 @@ import tensorflow as tf
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-
 # Root directory of the project
-ROOT_DIR = os.path.abspath("../../")
+import glob
+
+# ROOT_DIR = os.path.abspath("../../")
+ROOT_DIR = os.path.abspath("/home/adam/workspace/github/Mask_RCNN")
 
 # Import Mask RCNN
 sys.path.append(ROOT_DIR)  # To find local version of the library
@@ -22,11 +24,12 @@ from mrcnn.visualize import display_images
 import mrcnn.model as modellib
 from mrcnn.model import log
 from samples.seal import seal
+from samples.seal.seal import remove2
 import cv2
 
 SEAL_DIR = os.path.join(ROOT_DIR, 'samples', 'seal')
 # Directory to save logs and trained model
-MODEL_DIR = os.path.join(SEAL_DIR, 'logs')
+MODEL_DIR = os.path.join(SEAL_DIR, 'models')
 config = seal.SealConfig()
 DATASET_DIR = osp.join(ROOT_DIR, 'datasets', 'seal')
 
@@ -42,7 +45,7 @@ config = InferenceConfig()
 # config.display()
 # Device to load the neural network on. Useful if you're training a model on the same machine,
 # in which case use CPU and leave the GPU for training.
-DEVICE = "/gpu:0"  # /cpu:0 or /gpu:0
+DEVICE = "/gpu:1"  # /cpu:0 or /gpu:0
 
 # Inspect the model in training or inference modes
 # values: 'inference' or 'training'
@@ -75,7 +78,7 @@ with tf.device(DEVICE):
 
 # Download file from the Releases page and set its path
 # https://github.com/matterport/Mask_RCNN/releases
-weights_path = osp.join(MODEL_DIR, 'seals20181012T1645/mask_rcnn_seals_0030.h5')
+weights_path = osp.join(MODEL_DIR, 'mask_rcnn_seals_0030.h5')
 
 # Or, load the last model you trained
 # weights_path = model.find_last()
@@ -428,4 +431,115 @@ def visualize_activations():
     display_images(np.transpose(activations["res2c_out"][0, :, :, :4], [2, 0, 1]), cols=4)
 
 
-visualize_activations()
+# visualize_activations()
+
+def show_mrcnn_prediction(image):
+    resized_image, window, scale, padding, crop = utils.resize_image(
+        image,
+        min_dim=config.IMAGE_MIN_DIM,
+        min_scale=config.IMAGE_MIN_SCALE,
+        max_dim=config.IMAGE_MAX_DIM,
+        mode=config.IMAGE_RESIZE_MODE)
+    # Get input and output to classifier and mask heads.
+    mrcnn = model.run_graph([resized_image], [
+        ("proposals", model.keras_model.get_layer("ROI").output),
+        ("probs", model.keras_model.get_layer("mrcnn_class").output),
+        ("deltas", model.keras_model.get_layer("mrcnn_bbox").output),
+        ("masks", model.keras_model.get_layer("mrcnn_mask").output),
+        ("detections", model.keras_model.get_layer("mrcnn_detection").output),
+    ])
+    ################################## display detections ###############################################
+    # Get detection class IDs. Trim zero padding.
+    det_class_ids = mrcnn['detections'][0, :, 4].astype(np.int32)
+    padding_start_ix = np.where(det_class_ids == 0)[0][0]
+    det_class_ids = det_class_ids[:padding_start_ix]
+    detections = mrcnn['detections'][0, :padding_start_ix]
+    log('trimmed_detection', detections)
+
+    print("{} detections: {}".format(
+        padding_start_ix, np.array(dataset.class_names)[det_class_ids]))
+    ################################### display proposals ##########################################
+    # Proposals are in normalized coordinates. Scale them to image coordinates.
+    h, w = resized_image.shape[:2]
+    proposals = np.around(mrcnn["proposals"][0] * np.array([h, w, h, w])).astype(np.int32)
+
+    # Class ID, score, and mask per proposal
+    # mrcnn 的 shape 为 (batch_size, num_proposals=1000, num_classes)
+    proposal_class_ids = np.argmax(mrcnn["probs"][0], axis=1)
+    proposal_class_scores = mrcnn["probs"][0, np.arange(proposal_class_ids.shape[0]), proposal_class_ids]
+    proposal_class_names = np.array(dataset.class_names)[proposal_class_ids]
+    proposal_positive_ixs = np.where(proposal_class_ids > 0)[0]
+
+    # How many ROIs vs empty rows?
+    print("{} valid proposals out of {}".format(np.sum(np.any(proposals, axis=1)), proposals.shape[0]))
+    print("{} positive ROIs".format(len(proposal_positive_ixs)))
+
+    # Class counts
+    print(list(zip(*np.unique(proposal_class_names, return_counts=True))))
+    # Display a random sample of proposals.
+    # Proposals classified as background are dotted, and
+    # the rest show their class and confidence score.
+    limit = 200
+    #################################### apply bounding box refinement #############################
+    # Class-specific bounding box shifts.
+    # mrcnn['deltas'] 的 shape 为 (batch_size, num_proposals=1000, num_classes, 4)
+    proposal_deltas = mrcnn["deltas"][0, np.arange(proposals.shape[0]), proposal_class_ids]
+    log("proposals_deltas", proposal_deltas)
+
+    # Apply bounding box transformations
+    # Shape: (num_proposals=1000, (y1, x1, y2, x2)]
+    # NOTE: delta 是不分 normalized coordinates 和 pixel coordinates 的
+    refined_proposals = utils.apply_box_deltas(
+        proposals, proposal_deltas * config.BBOX_STD_DEV).astype(np.int32)
+    log("refined_proposals", refined_proposals)
+    #################################### more steps ################################################
+    # Remove boxes classified as background
+    keep_proposal_ixs = np.where(proposal_class_ids > 0)[0]
+    print("Remove background proposals. Keep {}:\n{}".format(keep_proposal_ixs.shape[0], keep_proposal_ixs))
+    # Remove low confidence detections
+    keep_proposal_ixs = np.intersect1d(keep_proposal_ixs,
+                                       np.where(proposal_class_scores >= config.DETECTION_MIN_CONFIDENCE)[0])
+    print("Remove proposals below {} confidence. Keep {}:\n{}".format(
+        config.DETECTION_MIN_CONFIDENCE, keep_proposal_ixs.shape[0], keep_proposal_ixs))
+    # Apply per-class non-max suppression
+    pre_nms_proposals = refined_proposals[keep_proposal_ixs]
+    pre_nms_proposal_scores = proposal_class_scores[keep_proposal_ixs]
+    pre_nms_proposal_class_ids = proposal_class_ids[keep_proposal_ixs]
+
+    nms_keep_proposal_ixs = []
+    for class_id in np.unique(pre_nms_proposal_class_ids):
+        # Pick detections of this class
+        ixs = np.where(pre_nms_proposal_class_ids == class_id)[0]
+        # Apply NMS
+        class_keep = utils.non_max_suppression(pre_nms_proposals[ixs],
+                                               pre_nms_proposal_scores[ixs],
+                                               config.DETECTION_NMS_THRESHOLD)
+        # Map indicies
+        class_keep_proposal_ixs = keep_proposal_ixs[ixs[class_keep]]
+        nms_keep_proposal_ixs = np.union1d(nms_keep_proposal_ixs, class_keep_proposal_ixs)
+        print("{:12}: {} -> {}".format(dataset.class_names[class_id][:10], keep_proposal_ixs[ixs],
+                                       class_keep_proposal_ixs))
+
+    keep_proposal_ixs = np.intersect1d(keep_proposal_ixs, nms_keep_proposal_ixs).astype(np.int32)
+    print("\nKeep after per-class NMS: {}\n{}".format(keep_proposal_ixs.shape[0], keep_proposal_ixs))
+    #################################### Show final detections #####################################
+    ixs = np.arange(len(keep_proposal_ixs))  # Display all
+    refined_bboxes = refined_proposals[keep_proposal_ixs][ixs]
+    refined_bboxes -= np.array([window[0], window[1], window[0], window[1]])
+    bboxes = refined_bboxes.astype('float32') / scale
+    bboxes = bboxes.tolist()
+    return bboxes
+    # for bbox in bboxes:
+    #     cv2.rectangle(image, (round(bbox[1]), round(bbox[0])), (round(bbox[3]), round(bbox[2])), (0, 255, 0), 2)
+    # cv2.namedWindow('image', cv2.WINDOW_NORMAL)
+    # cv2.imshow('image', image)
+    # cv2.waitKey(0)
+
+
+# for image_filepath in glob.glob('/home/adam/Pictures/vat/train/*.jpg'):
+#     image = cv2.imread(image_filepath)
+#     show_mrcnn_prediction(image)
+
+
+# for image_path in glob.glob('/home/adam/Videos/*.jpg'):
+#     remove2(model, image_path)
